@@ -1,0 +1,175 @@
+name: Release
+
+# Publishes immutable GitHub Release assets for forge server:install.
+# Tag format: vX.Y.Z (semantic). Assets: eregion-<os>-<arch>[.exe] + checksums.txt
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: eregion-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: eregion-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            asset: eregion-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            asset: eregion-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            asset: eregion-windows-amd64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "$FILE_VERSION" != "$VERSION" ]; then
+            echo "::warning::VERSION file is ${FILE_VERSION}, tag implies ${VERSION}; embedding tag version"
+          fi
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.Version=${{ steps.ver.outputs.version }}" \
+            -o "dist/${{ matrix.asset }}" \
+            ./cmd/eregion
+
+      - name: Smoke version (linux/amd64 host binary only)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          chmod +x "dist/${{ matrix.asset }}"
+          "dist/${{ matrix.asset }}" version
+          "dist/${{ matrix.asset }}" version | grep -E "^eregion ${{ steps.ver.outputs.version }}$"
+          "dist/${{ matrix.asset }}" version | grep -E '^protocol eregion/1$'
+          "dist/${{ matrix.asset }}" --version | grep -E '^protocol eregion/1$'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums.txt
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          assets=(
+            eregion-linux-amd64
+            eregion-linux-arm64
+            eregion-darwin-amd64
+            eregion-darwin-arm64
+            eregion-windows-amd64.exe
+          )
+          for f in "${assets[@]}"; do
+            test -f "$f" || { echo "missing asset: $f"; ls -la; exit 1; }
+          done
+          sha256sum "${assets[@]}" > checksums.txt
+          chmod +x eregion-linux-amd64 eregion-linux-arm64 eregion-darwin-amd64 eregion-darwin-arm64
+          ls -la
+          cat checksums.txt
+
+      - name: Create release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          cat > /tmp/release-notes.md <<EOF
+          ## Eregion ${VERSION}
+
+          Canonical binary distribution for MithrilPHP Forge (\`forge server:install\`).
+
+          **Protocol:** \`eregion/1\` (EREGION/1)
+
+          ### Assets
+
+          | Asset | Platform |
+          |-------|----------|
+          | \`eregion-linux-amd64\` | Linux x86_64 |
+          | \`eregion-linux-arm64\` | Linux aarch64 |
+          | \`eregion-darwin-amd64\` | macOS Intel |
+          | \`eregion-darwin-arm64\` | macOS Apple Silicon |
+          | \`eregion-windows-amd64.exe\` | Windows x86_64 |
+          | \`checksums.txt\` | SHA-256 of all assets |
+
+          Install example:
+
+          \`\`\`bash
+          curl -fsSL -o eregion "https://github.com/${{ github.repository }}/releases/download/${TAG}/eregion-linux-amd64"
+          curl -fsSL -o checksums.txt "https://github.com/${{ github.repository }}/releases/download/${TAG}/checksums.txt"
+          sha256sum -c checksums.txt --ignore-missing
+          chmod +x eregion
+          ./eregion version
+          \`\`\`
+
+          Version output contract:
+
+          \`\`\`text
+          eregion ${VERSION}
+          protocol eregion/1
+          \`\`\`
+
+          Do not rewrite assets on this tag after publication.
+          EOF
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Eregion ${{ github.ref_name }}
+          body_path: /tmp/release-notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/eregion-linux-amd64
+            dist/eregion-linux-arm64
+            dist/eregion-darwin-amd64
+            dist/eregion-darwin-arm64
+            dist/eregion-windows-amd64.exe
+            dist/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
