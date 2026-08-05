@@ -142,9 +142,8 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := d.pool.Client().Send(reqCtx, wrk, env)
 	if err != nil {
 		d.pool.Discard(wrk, err)
-		// Classify by the error returned from Send, not reqCtx.Err(): a protocol
-		// failure that lands near the deadline must stay 502, not 504.
-		timedOut := errors.Is(err, context.DeadlineExceeded)
+		// Socket deadlines from SendRequest surface as net timeouts, not context errors.
+		timedOut := errors.Is(err, context.DeadlineExceeded) || isTimeoutErr(err)
 		if d.metrics != nil {
 			if timedOut {
 				d.metrics.IncError("timeout")
@@ -252,4 +251,9 @@ func remoteAddr(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }

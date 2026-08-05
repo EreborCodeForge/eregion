@@ -170,17 +170,7 @@ func (c *Client) Send(ctx context.Context, w *Worker, req protocol.RequestEnvelo
 	select {
 	case <-ctx.Done():
 		_ = conn.Close()
-		// If the worker already produced a result (e.g. protocol failure), prefer it
-		// over the deadline so callers can return 502 instead of 504.
-		select {
-		case r := <-ch:
-			if r.err != nil {
-				return r.resp, r.err
-			}
-			return r.resp, nil
-		default:
-			return protocol.ResponseEnvelope{}, ctx.Err()
-		}
+		return protocol.ResponseEnvelope{}, ctx.Err()
 	case r := <-ch:
 		return r.resp, r.err
 	}
