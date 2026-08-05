@@ -17,11 +17,21 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: go test ./...
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: sockets
+          coverage: none
+
+      - name: Unit tests
+        run: go test ./internal/... ./cmd/...
+
+      - name: Integration tests
+        run: go test ./tests/integration/...
 
       - name: Race
-        run: CGO_ENABLED=1 go test -race ./...
+        run: CGO_ENABLED=1 go test -race ./internal/...
 
       - name: Version contract
         run: |

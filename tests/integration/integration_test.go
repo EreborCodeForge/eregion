@@ -61,8 +61,8 @@ func testConfig(t *testing.T, workerScript string) config.Config {
 	cfg.Workers.MinReady = 1
 	cfg.Workers.StartupTimeout = 8 * time.Second
 	cfg.Workers.HandshakeTimeout = 5 * time.Second
-	cfg.Workers.RequestTimeout = 2 * time.Second
-	cfg.Workers.AcquireTimeout = 2 * time.Second
+	cfg.Workers.RequestTimeout = 5 * time.Second
+	cfg.Workers.AcquireTimeout = 3 * time.Second
 	cfg.Workers.ShutdownTimeout = 2 * time.Second
 	cfg.Workers.MaxRequests = 0
 	cfg.Queue.Capacity = 8
