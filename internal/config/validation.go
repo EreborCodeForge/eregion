@@ -6,7 +6,7 @@ import (
 )
 
 // Validate checks the resolved configuration.
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	if c.Version != "" && c.Version != "1" {
 		return fmt.Errorf("unsupported config version %q", c.Version)
 	}
@@ -106,6 +106,16 @@ func (c Config) Validate() error {
 
 	if c.Operations.Prefix == "" {
 		return fmt.Errorf("operations.prefix is required")
+	}
+	if !strings.HasPrefix(c.Operations.Prefix, "/") {
+		return fmt.Errorf("operations.prefix must start with /")
+	}
+
+	if err := c.ResolveEndpoints(); err != nil {
+		return err
+	}
+	if err := validateEndpointCollisions(*c); err != nil {
+		return err
 	}
 
 	return nil

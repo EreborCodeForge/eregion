@@ -51,14 +51,10 @@ func (ExecSpawner) Spawn(ctx context.Context, spec ProcessSpecification) (*exec.
 	if spec.Manifest != "" {
 		args = append(args, "--manifest="+spec.Manifest)
 	}
-	_ = ctx
 	cmd := exec.Command(spec.Binary, args...)
 	cmd.Dir = spec.WorkingDirectory
-	env := os.Environ()
-	for k, v := range spec.Environment {
-		env = append(env, k+"="+v)
-	}
-	cmd.Env = env
+	cmd.Env = EnvironMerged(spec.Environment)
+	_ = ctx // startup bound is enforced by wait/dial timeouts in Starter.Start
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -260,6 +256,7 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 		w.State = StateFailed
 		return nil, fmt.Errorf("dial %s: %w", sockPath, err)
 	}
+	cancel() // startup phase done; do not cancel handshake via startup deadline
 
 	hello := protocol.Hello{
 		Type:            protocol.TypeHello,
@@ -269,7 +266,9 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 		WorkerID:        id,
 		Generation:      generation,
 	}
-	ready, err := protocol.PerformHandshake(startCtx, conn, s.cfg.Protocol.MaxFrameBytes, hello, s.cfg.Workers.HandshakeTimeout)
+	hsCtx, hsCancel := context.WithTimeout(ctx, s.cfg.Workers.HandshakeTimeout)
+	defer hsCancel()
+	ready, err := protocol.PerformHandshake(hsCtx, conn, s.cfg.Protocol.MaxFrameBytes, hello, s.cfg.Workers.HandshakeTimeout)
 	if err != nil {
 		_ = conn.Close()
 		_ = terminateProcess(cmd, s.cfg.Workers.ShutdownTimeout)
@@ -318,16 +317,19 @@ func terminateProcess(cmd *exec.Cmd, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+	if cmd.ProcessState != nil {
+		return nil
+	}
 	if err := cmd.Process.Signal(syscallSIGTERM()); err != nil {
 		return cmd.Process.Kill()
 	}
-	done := make(chan struct{})
-	go func() {
-		// Best-effort: another goroutine may own Wait(); we only enforce Kill deadline.
-		time.Sleep(grace)
-		close(done)
-	}()
-	<-done
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if cmd.ProcessState != nil {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if cmd.ProcessState == nil {
 		_ = cmd.Process.Kill()
 	}

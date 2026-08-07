@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,7 @@ type Metrics interface {
 	DecInFlight()
 	IncInFlight()
 	ObserveDuration(seconds float64)
+	ObserveQueueWait(seconds float64)
 	IncError(kind string)
 	IncQueueReject()
 }
@@ -46,7 +49,7 @@ func New(cfg config.Config, pool *worker.Pool, logger *slog.Logger, metrics Metr
 	return &Dispatcher{cfg: cfg, pool: pool, logger: logger, metrics: metrics}
 }
 
-// Waiting returns current admitted waiters.
+// Waiting returns current queue waiters (requests waiting for a worker, not executing).
 func (d *Dispatcher) Waiting() int {
 	d.queueMu.Lock()
 	defer d.queueMu.Unlock()
@@ -56,7 +59,11 @@ func (d *Dispatcher) Waiting() int {
 func (d *Dispatcher) tryEnterQueue() bool {
 	d.queueMu.Lock()
 	defer d.queueMu.Unlock()
-	if d.cfg.Queue.Capacity >= 0 && d.waiting >= d.cfg.Queue.Capacity {
+	// capacity 0 means no queue: never admit waiters.
+	if d.cfg.Queue.Capacity <= 0 {
+		return false
+	}
+	if d.waiting >= d.cfg.Queue.Capacity {
 		return false
 	}
 	d.waiting++
@@ -74,6 +81,15 @@ func (d *Dispatcher) leaveQueue() {
 // ServeHTTP handles application requests.
 func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Operations endpoints are registered on the mux; anything else under the
+	// operations prefix (including disabled endpoints) must not hit PHP workers.
+	prefix := d.cfg.Operations.Prefix
+	if prefix != "" && (r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/")) {
+		http.NotFound(w, r)
+		return
+	}
+
 	if d.metrics != nil {
 		d.metrics.IncRequests()
 		d.metrics.IncInFlight()
@@ -86,36 +102,54 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			d.metrics.IncError("body")
 		}
 		http.Error(w, `{"error":"request_entity_too_large","message":"Request body exceeds configured limit."}`, http.StatusRequestEntityTooLarge)
+		d.accessLog("method", r.Method, "path", r.URL.Path, "status", http.StatusRequestEntityTooLarge,
+			"duration_ms", time.Since(start).Milliseconds(), "error", "request_entity_too_large")
 		return
 	}
 
-	if !d.tryEnterQueue() {
-		if d.metrics != nil {
-			d.metrics.IncQueueReject()
-			d.metrics.IncError("capacity")
-		}
-		d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error":   "server_capacity_exceeded",
-			"message": "No worker capacity is currently available.",
-		}, retryAfterSeconds(d.cfg.Queue.RetryAfter))
-		return
-	}
-	defer d.leaveQueue()
+	var wrk *worker.Worker
+	var queueWait time.Duration
 
-	acquireCtx, cancel := context.WithTimeout(r.Context(), d.cfg.Workers.AcquireTimeout)
-	defer cancel()
-	queueWaitStart := time.Now()
-	wrk, err := d.pool.Acquire(acquireCtx)
-	queueWait := time.Since(queueWaitStart)
-	if err != nil {
-		if d.metrics != nil {
-			d.metrics.IncError("acquire")
+	if wtry, ok := d.pool.TryAcquire(); ok {
+		wrk = wtry
+	} else {
+		if !d.tryEnterQueue() {
+			if d.metrics != nil {
+				d.metrics.IncQueueReject()
+				d.metrics.IncError("capacity")
+			}
+			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error":   "server_capacity_exceeded",
+				"message": "No worker capacity is currently available.",
+			}, RetryAfterSeconds(d.cfg.Queue.RetryAfter))
+			d.accessLog("method", r.Method, "path", r.URL.Path, "status", http.StatusServiceUnavailable,
+				"duration_ms", time.Since(start).Milliseconds(), "error", "queue_full")
+			return
 		}
-		d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error":   "server_capacity_exceeded",
-			"message": "No worker capacity is currently available.",
-		}, retryAfterSeconds(d.cfg.Queue.RetryAfter))
-		return
+
+		acquireCtx, cancel := context.WithTimeout(r.Context(), d.cfg.Workers.AcquireTimeout)
+		queueWaitStart := time.Now()
+		acquired, err := d.pool.Acquire(acquireCtx)
+		queueWait = time.Since(queueWaitStart)
+		cancel()
+		d.leaveQueue()
+		if d.metrics != nil && queueWait > 0 {
+			d.metrics.ObserveQueueWait(queueWait.Seconds())
+		}
+		if err != nil {
+			if d.metrics != nil {
+				d.metrics.IncError("acquire")
+			}
+			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error":   "server_capacity_exceeded",
+				"message": "No worker capacity is currently available.",
+			}, RetryAfterSeconds(d.cfg.Queue.RetryAfter))
+			d.accessLog("method", r.Method, "path", r.URL.Path, "status", http.StatusServiceUnavailable,
+				"duration_ms", time.Since(start).Milliseconds(), "queue_wait_ms", queueWait.Milliseconds(),
+				"error", "acquire_timeout")
+			return
+		}
+		wrk = acquired
 	}
 
 	reqID := fmt.Sprintf("req-%d", d.reqSeq.Add(1))
@@ -142,21 +176,30 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := d.pool.Client().Send(reqCtx, wrk, env)
 	if err != nil {
 		d.pool.Discard(wrk, err)
-		// Socket deadlines from SendRequest surface as net timeouts, not context errors.
 		timedOut := errors.Is(err, context.DeadlineExceeded) || isTimeoutErr(err)
+		status := http.StatusBadGateway
+		errKind := "protocol"
+		if timedOut {
+			status = http.StatusGatewayTimeout
+			errKind = "timeout"
+		}
 		if d.metrics != nil {
-			if timedOut {
-				d.metrics.IncError("timeout")
-			} else {
-				d.metrics.IncError("protocol")
-			}
+			d.metrics.IncError(errKind)
 			d.metrics.ObserveDuration(time.Since(start).Seconds())
 		}
 		if timedOut {
 			http.Error(w, `{"error":"gateway_timeout","message":"Worker request timed out."}`, http.StatusGatewayTimeout)
-			return
+		} else {
+			http.Error(w, `{"error":"bad_gateway","message":"Worker failed while processing the request."}`, http.StatusBadGateway)
 		}
-		http.Error(w, `{"error":"bad_gateway","message":"Worker failed while processing the request."}`, http.StatusBadGateway)
+		attrs := []any{
+			"request_id", reqID, "worker_id", wrk.ID, "generation", wrk.Generation,
+			"method", r.Method, "path", r.URL.Path, "status", status,
+			"duration_ms", time.Since(start).Milliseconds(), "queue_wait_ms", queueWait.Milliseconds(),
+			"error", errKind,
+		}
+		attrs = append(attrs, d.maybeLogExtras(r, body, nil)...)
+		d.accessLog(attrs...)
 		return
 	}
 
@@ -178,22 +221,26 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if d.metrics != nil {
 		d.metrics.ObserveDuration(time.Since(start).Seconds())
 	}
-	if d.cfg.Logging.AccessLog {
-		d.logger.Info("access",
-			"request_id", reqID,
-			"worker_id", wrk.ID,
-			"generation", wrk.Generation,
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", resp.Status,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"queue_wait_ms", queueWait.Milliseconds(),
-		)
+	attrs := []any{
+		"request_id", reqID,
+		"worker_id", wrk.ID,
+		"generation", wrk.Generation,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", resp.Status,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"queue_wait_ms", queueWait.Milliseconds(),
 	}
+	attrs = append(attrs, d.maybeLogExtras(r, body, resp.Body)...)
+	d.accessLog(attrs...)
 }
 
-func retryAfterSeconds(d time.Duration) int {
-	s := int(d.Seconds())
+// RetryAfterSeconds converts a duration to an HTTP Retry-After integer (ceil, min 1).
+func RetryAfterSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 1
+	}
+	s := int(math.Ceil(d.Seconds()))
 	if s < 1 {
 		return 1
 	}

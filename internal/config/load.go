@@ -270,13 +270,13 @@ func applyFile(cfg *Config, file *fileConfig) error {
 	}
 
 	q := &file.Queue
-	queueCapacitySet := q.Capacity != nil
 	if q.Capacity != nil {
 		cfg.Queue.Capacity = *q.Capacity
+		cfg.QueueCapacityDerived = false
 	} else if w.Count != nil {
-		cfg.Queue.Capacity = *w.Count * 8
+		cfg.Queue.Capacity = DerivedQueueCapacity(*w.Count)
+		cfg.QueueCapacityDerived = true
 	}
-	_ = queueCapacitySet
 	if err := applyDuration(&cfg.Queue.RetryAfter, q.RetryAfter, "queue.retry_after"); err != nil {
 		return err
 	}

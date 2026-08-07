@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/EreborCodeForge/Eregion/internal/config"
@@ -34,6 +33,12 @@ type PoolSnapshot struct {
 	Capacity int
 }
 
+// PoolMetrics records recycle and restart events.
+type PoolMetrics interface {
+	IncRecycle(reason string)
+	IncRestart()
+}
+
 // Pool manages a fixed set of PHP workers.
 type Pool struct {
 	cfg     config.Config
@@ -41,17 +46,19 @@ type Pool struct {
 	starter *Starter
 	client  *Client
 	logger  *slog.Logger
+	metrics PoolMetrics
 
 	mu       sync.Mutex
 	slots    []*slot
 	idle     chan *Worker
-	waiting  int32
 	stopping bool
 	wg       sync.WaitGroup
 	cancel   context.CancelFunc
 	ctx      context.Context
 
 	onChange func()
+	// queueWaiting is set by the server to the dispatcher waiting counter (single source of truth).
+	queueWaiting func() int
 }
 
 type slot struct {
@@ -79,6 +86,19 @@ func NewPool(cfg config.Config, sockets *socket.Manager, logger *slog.Logger, ve
 
 // SetOnChange registers a callback after pool state changes (metrics).
 func (p *Pool) SetOnChange(fn func()) { p.onChange = fn }
+
+// SetMetrics wires recycle/restart counters.
+func (p *Pool) SetMetrics(m PoolMetrics) { p.metrics = m }
+
+// SetQueueWaitingProvider registers the single source of truth for queue_waiting.
+func (p *Pool) SetQueueWaitingProvider(fn func() int) { p.queueWaiting = fn }
+
+// IsStopping reports whether the pool is shutting down.
+func (p *Pool) IsStopping() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stopping
+}
 
 func (p *Pool) notify() {
 	if p.onChange != nil {
@@ -226,6 +246,9 @@ func (p *Pool) monitor(s *slot, w *Worker) {
 		p.recordCrashLocked(s)
 		failed := p.exceededRestartPolicyLocked(s)
 		p.mu.Unlock()
+		if p.metrics != nil {
+			p.metrics.IncRestart()
+		}
 		if failed {
 			p.logger.Error("worker slot entered failed state", "slot", s.index)
 			p.notify()
@@ -299,11 +322,39 @@ func (p *Pool) scheduleRestart(s *slot, useBackoff bool) {
 	}()
 }
 
+// TryAcquire attempts to take an idle worker without blocking.
+func (p *Pool) TryAcquire() (*Worker, bool) {
+	p.mu.Lock()
+	if p.stopping {
+		p.mu.Unlock()
+		return nil, false
+	}
+	p.mu.Unlock()
+
+	for {
+		select {
+		case w := <-p.idle:
+			p.mu.Lock()
+			stopping := p.stopping
+			current := p.slots[w.Slot-1].worker
+			p.mu.Unlock()
+			if stopping {
+				return nil, false
+			}
+			if current == nil || current.Generation != w.Generation || w.getState() != StateIdle {
+				continue
+			}
+			w.setState(StateBusy)
+			p.notify()
+			return w, true
+		default:
+			return nil, false
+		}
+	}
+}
+
 // Acquire waits for an idle worker.
 func (p *Pool) Acquire(ctx context.Context) (*Worker, error) {
-	atomic.AddInt32(&p.waiting, 1)
-	defer atomic.AddInt32(&p.waiting, -1)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -336,33 +387,44 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 	if w == nil {
 		return
 	}
-	if resp != nil {
-		w.mu.Lock()
-		w.RequestsHandled = resp.Meta.RequestsHandled
-		if w.RequestsHandled == 0 {
-			w.RequestsHandled++
-		}
-		w.mu.Unlock()
+
+	w.mu.Lock()
+	w.RequestsHandled++
+	handled := w.RequestsHandled
+	w.mu.Unlock()
+
+	if resp != nil && resp.Meta.RequestsHandled > 0 && resp.Meta.RequestsHandled != handled {
+		p.logger.Debug("worker meta requests_handled mismatch",
+			"worker_id", w.ID,
+			"runtime", handled,
+			"meta", resp.Meta.RequestsHandled,
+		)
 	}
 
-	recycle := resp != nil && resp.Meta.Recycle
-	if !recycle && p.cfg.Workers.MaxRequests > 0 {
-		if int(w.GetSnapshot().RequestsHandled) >= p.cfg.Workers.MaxRequests {
-			recycle = true
-			if resp != nil && resp.Meta.RecycleReason == "" {
-				resp.Meta.Recycle = true
-				resp.Meta.RecycleReason = "max_requests"
-			}
+	recycle := false
+	reason := ""
+	if resp != nil && resp.Meta.Recycle {
+		recycle = true
+		reason = resp.Meta.RecycleReason
+		if reason == "" {
+			reason = "worker_requested"
 		}
+	}
+	if !recycle && p.cfg.Workers.MaxRequests > 0 && int(handled) >= p.cfg.Workers.MaxRequests {
+		recycle = true
+		reason = "max_requests"
 	}
 	if !recycle && p.cfg.Workers.MemoryLimitMB > 0 && resp != nil && resp.Meta.MemoryUsage > 0 {
 		limit := uint64(p.cfg.Workers.MemoryLimitMB) * 1024 * 1024
 		if resp.Meta.MemoryUsage >= limit {
 			recycle = true
-			resp.Meta.Recycle = true
-			if resp.Meta.RecycleReason == "" {
-				resp.Meta.RecycleReason = "memory_limit"
-			}
+			reason = "memory_limit"
+		}
+	}
+	if recycle && resp != nil {
+		resp.Meta.Recycle = true
+		if resp.Meta.RecycleReason == "" {
+			resp.Meta.RecycleReason = reason
 		}
 	}
 
@@ -378,17 +440,18 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 		w.setState(StateDraining)
 		conn := w.conn
 		p.mu.Unlock()
-		if recycle && resp != nil {
-			reason := resp.Meta.RecycleReason
+		if recycle {
 			if reason == "" {
 				reason = "planned"
 			}
 			p.logger.Info("planned recycle", "worker_id", w.ID, "reason", reason)
+			if p.metrics != nil {
+				p.metrics.IncRecycle(reason)
+			}
 		}
 		if conn != nil {
-			_ = conn.Close() // encourage PHP to exit after recycle intent
+			_ = conn.Close()
 		}
-		// Ask process to exit gently if still alive.
 		if w.cmd != nil && w.cmd.Process != nil {
 			_ = w.cmd.Process.Signal(syscallSIGTERM())
 		}
@@ -436,17 +499,26 @@ func (p *Pool) Discard(w *Worker, reason error) {
 // Client returns the shared worker client.
 func (p *Pool) Client() *Client { return p.client }
 
-// Waiting returns current queue waiters (approx).
-func (p *Pool) Waiting() int { return int(atomic.LoadInt32(&p.waiting)) }
+// Waiting returns current queue waiters from the dispatcher provider.
+func (p *Pool) Waiting() int {
+	if p.queueWaiting != nil {
+		return p.queueWaiting()
+	}
+	return 0
+}
 
 // Snapshot returns pool counters.
 func (p *Pool) Snapshot() PoolSnapshot {
+	waiting := 0
+	if p.queueWaiting != nil {
+		waiting = p.queueWaiting()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	snap := PoolSnapshot{
 		Desired:  p.cfg.Workers.Count,
 		Capacity: p.cfg.Queue.Capacity,
-		Waiting:  int(atomic.LoadInt32(&p.waiting)),
+		Waiting:  waiting,
 	}
 	for _, s := range p.slots {
 		if s.worker == nil {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/EreborCodeForge/Eregion/internal/config"
@@ -20,12 +21,13 @@ import (
 
 // Server is the top-level Eregion HTTP application server.
 type Server struct {
-	cfg     config.Config
-	logger  *slog.Logger
-	version string
-	pool    *worker.Pool
-	metrics *telemetry.Registry
-	http    *http.Server
+	cfg          config.Config
+	logger       *slog.Logger
+	version      string
+	pool         *worker.Pool
+	metrics      *telemetry.Registry
+	http         *http.Server
+	shuttingDown atomic.Bool
 }
 
 // New constructs a server from config.
@@ -43,6 +45,7 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 	pool := worker.NewPool(cfg, sockets, logger, version)
 	metrics := telemetry.NewRegistry(cfg, pool)
 	pool.SetOnChange(func() {})
+	pool.SetMetrics(metrics)
 
 	mux := http.NewServeMux()
 	s := &Server{cfg: cfg, logger: logger, version: version, pool: pool, metrics: metrics}
@@ -51,7 +54,7 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		mux.HandleFunc(cfg.Liveness.Path, telemetry.LiveHandler())
 	}
 	if cfg.Readiness.Enabled {
-		mux.HandleFunc(cfg.Readiness.Path, telemetry.ReadyHandler(pool, cfg))
+		mux.HandleFunc(cfg.Readiness.Path, telemetry.ReadyHandler(pool, cfg, s.IsShuttingDown))
 	}
 	if cfg.Health.Enabled {
 		mux.HandleFunc(cfg.Health.Path, telemetry.HealthHandler(pool, cfg))
@@ -61,6 +64,7 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 	}
 
 	disp := dispatcher.New(cfg, pool, logger, metrics)
+	pool.SetQueueWaitingProvider(disp.Waiting)
 	mux.Handle("/", disp)
 
 	s.http = &http.Server{
@@ -111,6 +115,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) shutdown() error {
 	s.logger.Info("graceful shutdown started")
+	s.shuttingDown.Store(true)
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.Server.ShutdownTimeout)
 	defer cancel()
 
@@ -124,6 +130,11 @@ func (s *Server) shutdown() error {
 		return httpErr
 	}
 	return poolErr
+}
+
+// IsShuttingDown reports whether graceful shutdown has started.
+func (s *Server) IsShuttingDown() bool {
+	return s.shuttingDown.Load()
 }
 
 // PrintStatus fetches a health URL and prints it.

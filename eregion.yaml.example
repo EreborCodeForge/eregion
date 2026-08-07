@@ -52,26 +52,28 @@ workers:
   # Use 0 para desativar.
   max_requests: 1000
 
-  # Tempo máximo para o processo iniciar, criar o socket e ficar disponível.
+  # Tempo máximo para o processo iniciar, criar o socket e aceitar dial.
+  # Não inclui o handshake (ver handshake_timeout).
   startup_timeout: 10s
 
-  # Tempo máximo para concluir o handshake EREGION/1.
+  # Tempo máximo para concluir o handshake EREGION/1 (HELLO/READY).
   handshake_timeout: 5s
 
   # Deadline de uma requisição já entregue ao worker.
   request_timeout: 30s
 
-  # Tempo máximo aguardando um worker ficar livre.
+  # Tempo máximo aguardando um worker ficar livre (fila).
   acquire_timeout: 2s
 
-  # Tempo dado ao worker para encerrar antes de SIGKILL.
+  # Tempo dado ao worker para encerrar (SIGTERM → wait → SIGKILL).
   shutdown_timeout: 5s
 
   # Reciclagem cooperativa baseada na memória reportada pelo PHP.
-  # Use 0 para desativar.
+  # Use 0 para desativar. Recycle planejado ≠ crash.
   memory_limit_mb: 256
 
-  # Número máximo de reinicializações dentro de restart_window.
+  # Máximo de crashes/restarts não planejados dentro de restart_window.
+  # Com limit=5, o 6º crash na janela marca o slot como Failed.
   restart_limit: 5
 
   # Janela usada para detectar crash loop.
@@ -79,6 +81,7 @@ workers:
 
   restart_backoff:
     # Espera inicial antes de reiniciar um worker que falhou.
+    # O backoff é resetado após um boot bem-sucedido.
     initial: 100ms
 
     # Limite máximo do backoff.
@@ -115,9 +118,11 @@ protocol:
 queue:
   # Quantidade máxima de requests esperando um worker.
   # Requests em execução não entram nessa contagem.
+  # Admitidos no máximo = workers.count + queue.capacity.
+  # capacity: 0 desativa a fila (só executa se houver worker livre; senão 503 imediato).
   capacity: 64
 
-  # Valor enviado no header Retry-After quando a capacidade estiver esgotada.
+  # Valor enviado no header Retry-After (segundos, arredondado para cima, mín. 1).
   retry_after: 1s
 
 logging:
@@ -127,32 +132,33 @@ logging:
   # text ou json.
   format: "json"
 
-  # Loga uma entrada resumida para cada request.
+  # Loga uma entrada resumida para cada request (inclui 413/503/504/502).
   access_log: true
 
-  # Headers nunca devem ser logados integralmente por padrão.
+  # Headers sensíveis (Authorization, Cookie, etc.) são sempre redigidos.
   include_request_headers: false
 
-  # Bodies nunca devem ser logados por padrão.
+  # Bodies de log são truncados (8 KiB); binários são omitidos.
   include_request_body: false
   include_response_body: false
 
 operations:
-  # Prefixo padrão dos endpoints internos.
+  # Prefixo dos endpoints internos. Paths relativos abaixo são unidos a este prefixo.
+  # Paths absolutos que já começam com o prefixo são aceitos (compat legado).
   prefix: "/_eregion"
 
 metrics:
   enabled: true
-  path: "/_eregion/metrics"
+  path: "/metrics"
 
 health:
   enabled: true
-  path: "/_eregion/health"
+  path: "/health"
 
 readiness:
   enabled: true
-  path: "/_eregion/ready"
+  path: "/ready"
 
 liveness:
   enabled: true
-  path: "/_eregion/live"
+  path: "/live"

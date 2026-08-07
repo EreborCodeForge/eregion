@@ -22,7 +22,7 @@ The canonical binary source is **GitHub Releases** — not `go build` from a clo
 Example (Linux amd64, pin a version):
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 REPO=EreborCodeForge/eregion
 curl -fsSL -o eregion \
   "https://github.com/${REPO}/releases/download/v${VERSION}/eregion-linux-amd64"
@@ -36,13 +36,11 @@ chmod +x eregion
 Version contract (Forge-parseable):
 
 ```text
-eregion 0.1.0
+eregion 0.2.0
 protocol eregion/1
 ```
 
 **Protocol:** `eregion/1` (EREGION/1). Production must pin a release tag; do not rely on `latest` alone.
-
-Full distribution contract: [`eregion-binary-distribution.md`](eregion-binary-distribution.md).
 
 ## Requirements (from source)
 
@@ -87,14 +85,19 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 
 - `workers.handshake_timeout` lives under `workers` (not `protocol`)
 - Transport and codec are fixed in v1: UDS + MessagePack
-- `queue.capacity` counts waiting requests only
+- `queue.capacity` counts **waiting** requests only; max admitted = `workers.count + queue.capacity`
+- `queue.capacity: 0` means no queue (execute only if a worker is free; otherwise immediate 503)
+- `operations.prefix` + relative endpoint paths (e.g. `/metrics`) resolve to `/_eregion/metrics`; absolute paths that already start with the prefix remain valid
+- Planned recycle (`max_requests`, `memory_limit_mb`, worker `meta.recycle`) is not a crash; crash loops use `restart_limit` / `restart_window` (slot Failed after more than `restart_limit` crashes in the window)
+- Restart backoff resets after a successful worker boot
+- `--workers` recomputes derived `queue.capacity` (`count * 8`) when capacity was not set explicitly in YAML
 - Unknown YAML fields fail startup
+
+Saturation smoke: `scripts/stress.sh http://127.0.0.1:8080`
 
 ## PHP / MithrilPHP side
 
-Este repositório implementa só o binário Go. O que a lib PHP deve implementar (bridge, worker, Forge, manifest, recycle) está em:
-
-- [mithrilphp-eregion-bridge-spec.md](mithrilphp-eregion-bridge-spec.md)
+Este repositório implementa só o binário Go. O worker PHP (bridge MithrilPHP) deve falar EREGION/1 sobre UDS + MessagePack; o protocolo desta release permanece compatível com workers existentes.
 
 ## Development
 

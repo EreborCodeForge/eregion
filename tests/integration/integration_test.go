@@ -292,3 +292,116 @@ func TestQueueFull(t *testing.T) {
 		t.Fatal("expected at least one 503")
 	}
 }
+
+func TestQueueCapacityZero(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "slow-worker.php"))
+	cfg.Workers.Count = 1
+	cfg.Workers.MinReady = 1
+	cfg.Workers.RequestTimeout = 5 * time.Second
+	cfg.Workers.AcquireTimeout = 2 * time.Second
+	cfg.Queue.Capacity = 0
+	base := startServer(t, cfg)
+
+	started := time.Now()
+	done := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			resp, err := http.Get(base + "/x?delay=1500")
+			if err != nil {
+				done <- 0
+				return
+			}
+			code := resp.StatusCode
+			resp.Body.Close()
+			done <- code
+		}()
+	}
+	codes := []int{<-done, <-done}
+	elapsed := time.Since(started)
+	saw200, saw503 := false, false
+	for _, c := range codes {
+		if c == 200 {
+			saw200 = true
+		}
+		if c == http.StatusServiceUnavailable {
+			saw503 = true
+		}
+	}
+	if !saw200 || !saw503 {
+		t.Fatalf("codes=%v want one 200 and one 503", codes)
+	}
+	// Immediate reject should not wait full acquire timeout for the 503.
+	if elapsed > 3*time.Second {
+		t.Fatalf("capacity=0 reject too slow: %v", elapsed)
+	}
+}
+
+func TestOpsPrefixRelative(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "healthy-worker.php"))
+	cfg.Operations.Prefix = "/_ops"
+	cfg.Liveness.Path = "/live"
+	cfg.Readiness.Path = "/ready"
+	cfg.Health.Path = "/health"
+	cfg.Metrics.Path = "/metrics"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Health.Path != "/_ops/health" {
+		t.Fatalf("health path = %q", cfg.Health.Path)
+	}
+	base := startServer(t, cfg)
+	resp, err := http.Get(base + "/_ops/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("live status %d", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte("alive")) {
+		t.Fatalf("live body %s", body)
+	}
+	resp, err = http.Get(base + "/_eregion/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if bytes.Contains(body, []byte(`"alive"`)) {
+		t.Fatal("old prefix should not serve liveness")
+	}
+}
+
+func TestMetricsDisabled404(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "healthy-worker.php"))
+	cfg.Metrics.Enabled = false
+	base := startServer(t, cfg)
+	resp, err := http.Get(base + cfg.Metrics.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestStartupFailure(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "startup-failure-worker.php"))
+	cfg.Workers.StartupTimeout = 800 * time.Millisecond
+	cfg.Workers.MinReady = 1
+	cfg.Workers.RestartLimit = 0 // allow retries? 0 means unlimited - use high min and short timeout
+	cfg.Server.Port = pickTCPPort(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv, err := server.New(cfg, logger, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = srv.Run(ctx)
+	if err == nil {
+		t.Fatal("expected startup failure")
+	}
+}

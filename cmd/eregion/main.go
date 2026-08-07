@@ -126,18 +126,10 @@ func cmdServe(args []string) int {
 		return 1
 	}
 	cfg.Manifest = *manifest
-	if *host != "" {
-		cfg.Server.Host = *host
-	}
-	if *port > 0 {
-		cfg.Server.Port = *port
-	}
-	if *workers > 0 {
-		cfg.Workers.Count = *workers
-		if err := cfg.Validate(); err != nil {
-			fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-			return 1
-		}
+	cfg.ApplyCLIOverrides(*host, *port, *workers)
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		return 1
 	}
 
 	logger, err := applog.New(cfg.Logging)

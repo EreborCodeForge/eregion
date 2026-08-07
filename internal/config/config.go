@@ -25,6 +25,10 @@ type Config struct {
 
 	// Manifest is set from the CLI and forwarded to PHP workers.
 	Manifest string
+
+	// QueueCapacityDerived is true when queue.capacity came from workers.count*8
+	// (default or recompute) rather than an explicit YAML value.
+	QueueCapacityDerived bool
 }
 
 type ServerConfig struct {
@@ -112,7 +116,7 @@ func Default() Config {
 		workerCount = 1
 	}
 
-	return Config{
+	cfg := Config{
 		Version: "1",
 		Server: ServerConfig{
 			Host:              "127.0.0.1",
@@ -160,7 +164,7 @@ func Default() Config {
 			MaxFrameBytes: 16 << 20,
 		},
 		Queue: QueueConfig{
-			Capacity:   workerCount * 8,
+			Capacity:   DerivedQueueCapacity(workerCount),
 			RetryAfter: time.Second,
 		},
 		Logging: LoggingConfig{
@@ -171,12 +175,15 @@ func Default() Config {
 			IncludeRequestBody:    false,
 			IncludeResponseBody:   false,
 		},
-		Operations: OperationsConfig{Prefix: "/_eregion"},
-		Metrics:    EndpointConfig{Enabled: true, Path: "/_eregion/metrics"},
-		Health:     EndpointConfig{Enabled: true, Path: "/_eregion/health"},
-		Readiness:  EndpointConfig{Enabled: true, Path: "/_eregion/ready"},
-		Liveness:   EndpointConfig{Enabled: true, Path: "/_eregion/live"},
+		Operations:           OperationsConfig{Prefix: "/_eregion"},
+		Metrics:              EndpointConfig{Enabled: true, Path: "/metrics"},
+		Health:               EndpointConfig{Enabled: true, Path: "/health"},
+		Readiness:            EndpointConfig{Enabled: true, Path: "/ready"},
+		Liveness:             EndpointConfig{Enabled: true, Path: "/live"},
+		QueueCapacityDerived: true,
 	}
+	_ = cfg.ResolveEndpoints()
+	return cfg
 }
 
 // Addr returns host:port for the HTTP server.
