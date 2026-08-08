@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 
 	"github.com/EreborCodeForge/Eregion/internal/config"
+	"github.com/EreborCodeForge/Eregion/internal/resources"
+	"github.com/EreborCodeForge/Eregion/internal/sizing"
 	"github.com/EreborCodeForge/Eregion/internal/worker"
 )
 
@@ -16,6 +18,16 @@ import (
 type Registry struct {
 	cfg  config.Config
 	pool *worker.Pool
+
+	// Cached once at startup (resource detection is not re-run per scrape).
+	runtimeCPULogical     float64
+	runtimeCPUAvailable   float64
+	runtimeGOMAXPROCS     float64
+	runtimeMemoryLimit    float64
+	workersPerCPU         float64
+	workersRecommended    float64
+	workersRecommendedMin float64
+	workersRecommendedMax float64
 
 	requestsTotal  atomic.Uint64
 	inFlight       atomic.Int64
@@ -29,9 +41,24 @@ type Registry struct {
 	restartTotal   atomic.Uint64
 }
 
-// NewRegistry creates metrics backed by the pool snapshot.
-func NewRegistry(cfg config.Config, pool *worker.Pool) *Registry {
-	return &Registry{cfg: cfg, pool: pool}
+// NewRegistry creates metrics backed by the pool snapshot and cached resource sizing.
+func NewRegistry(cfg config.Config, pool *worker.Pool, res resources.RuntimeResources, sz sizing.WorkerSizing) *Registry {
+	memLimit := float64(0)
+	if res.MemoryLimitKnown {
+		memLimit = float64(res.MemoryLimitBytes)
+	}
+	return &Registry{
+		cfg:                   cfg,
+		pool:                  pool,
+		runtimeCPULogical:     float64(res.LogicalCPUs),
+		runtimeCPUAvailable:   res.AvailableCPUs,
+		runtimeGOMAXPROCS:     float64(res.GOMAXPROCS),
+		runtimeMemoryLimit:    memLimit,
+		workersPerCPU:         sz.WorkersPerCPU,
+		workersRecommended:    float64(sz.RecommendedWorkers),
+		workersRecommendedMin: float64(sz.RecommendedMin),
+		workersRecommendedMax: float64(sz.RecommendedMax),
+	}
 }
 
 func (r *Registry) IncRequests()    { r.requestsTotal.Add(1) }
@@ -83,6 +110,11 @@ func (r *Registry) Handler() http.HandlerFunc {
 			return true
 		})
 
+		writeGauge("eregion_runtime_cpu_logical", r.runtimeCPULogical)
+		writeGauge("eregion_runtime_cpu_available", r.runtimeCPUAvailable)
+		writeGauge("eregion_runtime_gomaxprocs", r.runtimeGOMAXPROCS)
+		writeGauge("eregion_runtime_memory_limit_bytes", r.runtimeMemoryLimit)
+
 		writeGauge("eregion_workers_desired", float64(snap.Desired))
 		writeGauge("eregion_workers_running", float64(snap.Running))
 		writeGauge("eregion_workers_idle", float64(snap.Idle))
@@ -90,6 +122,10 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeGauge("eregion_workers_starting", float64(snap.Starting))
 		writeGauge("eregion_workers_draining", float64(snap.Draining))
 		writeGauge("eregion_workers_failed", float64(snap.Failed))
+		writeGauge("eregion_workers_per_cpu", r.workersPerCPU)
+		writeGauge("eregion_workers_recommended", r.workersRecommended)
+		writeGauge("eregion_workers_recommended_min", r.workersRecommendedMin)
+		writeGauge("eregion_workers_recommended_max", r.workersRecommendedMax)
 		writeGauge("eregion_queue_waiting", float64(snap.Waiting))
 		writeGauge("eregion_queue_capacity", float64(snap.Capacity))
 		writeCounter("eregion_worker_restarts_total", r.restartTotal.Load())

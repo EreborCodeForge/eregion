@@ -22,7 +22,7 @@ The canonical binary source is **GitHub Releases** — not `go build` from a clo
 Example (Linux amd64, pin a version):
 
 ```bash
-VERSION=0.2.0
+VERSION=0.3.0
 REPO=EreborCodeForge/eregion
 curl -fsSL -o eregion \
   "https://github.com/${REPO}/releases/download/v${VERSION}/eregion-linux-amd64"
@@ -92,6 +92,7 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 - Restart backoff resets after a successful worker boot
 - `--workers` recomputes derived `queue.capacity` (`count * 8`) when capacity was not set explicitly in YAML
 - Unknown YAML fields fail startup
+- At startup Eregion **detects** available CPU/memory by resolving the **current process cgroup** (leaf under `/sys/fs/cgroup`, not only the cgroup root; falls back to `GOMAXPROCS` / `NumCPU` outside limits) and logs a **worker sizing recommendation**. This is advisory only: `workers.count` remains authoritative and is never auto-resized. `GOMAXPROCS` does **not** cap PHP worker processes. Oversized pools (`workers_per_cpu > 8`) emit WARN but still start. Metrics include `eregion_runtime_cpu_*`, `eregion_runtime_memory_limit_bytes`, `eregion_workers_per_cpu`, and `eregion_workers_recommended{,_min,_max}` (cached once; `eregion_workers_desired` is the configured count)
 
 Saturation smoke: `scripts/stress.sh http://127.0.0.1:8080`
 

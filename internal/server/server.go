@@ -14,6 +14,8 @@ import (
 	"github.com/EreborCodeForge/Eregion/internal/config"
 	"github.com/EreborCodeForge/Eregion/internal/dispatcher"
 	"github.com/EreborCodeForge/Eregion/internal/lifecycle"
+	"github.com/EreborCodeForge/Eregion/internal/resources"
+	"github.com/EreborCodeForge/Eregion/internal/sizing"
 	"github.com/EreborCodeForge/Eregion/internal/socket"
 	"github.com/EreborCodeForge/Eregion/internal/telemetry"
 	"github.com/EreborCodeForge/Eregion/internal/worker"
@@ -26,6 +28,8 @@ type Server struct {
 	version      string
 	pool         *worker.Pool
 	metrics      *telemetry.Registry
+	runtimeRes   resources.RuntimeResources
+	workerSizing sizing.WorkerSizing
 	http         *http.Server
 	shuttingDown atomic.Bool
 }
@@ -41,14 +45,27 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		sockDir = abs
 		cfg.Socket.Directory = sockDir
 	}
+
+	// Observe-and-advise only: never mutates cfg.Workers.Count.
+	runtimeRes := resources.SystemDetector{Logger: logger}.Detect()
+	workerSizing := sizing.Advisor{}.Analyze(runtimeRes, cfg.Workers.Count)
+
 	sockets := socket.NewManager(cfg.Socket.Directory, cfg.Socket.DirectoryPermissions, cfg.Socket.SocketPermissions)
 	pool := worker.NewPool(cfg, sockets, logger, version)
-	metrics := telemetry.NewRegistry(cfg, pool)
+	metrics := telemetry.NewRegistry(cfg, pool, runtimeRes, workerSizing)
 	pool.SetOnChange(func() {})
 	pool.SetMetrics(metrics)
 
 	mux := http.NewServeMux()
-	s := &Server{cfg: cfg, logger: logger, version: version, pool: pool, metrics: metrics}
+	s := &Server{
+		cfg:          cfg,
+		logger:       logger,
+		version:      version,
+		pool:         pool,
+		metrics:      metrics,
+		runtimeRes:   runtimeRes,
+		workerSizing: workerSizing,
+	}
 
 	if cfg.Liveness.Enabled {
 		mux.HandleFunc(cfg.Liveness.Path, telemetry.LiveHandler())
@@ -82,6 +99,8 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 // Run starts workers and the HTTP server until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("starting eregion", "version", s.version, "addr", s.cfg.Addr(), "workers", s.cfg.Workers.Count)
+	sizing.LogRuntimeResources(s.logger, s.runtimeRes, s.workerSizing)
+	sizing.LogMemoryEnvelope(s.logger, s.runtimeRes, s.cfg.Workers.Count, s.cfg.Workers.MemoryLimitMB)
 
 	if err := s.pool.Start(ctx); err != nil {
 		return fmt.Errorf("start workers: %w", err)
