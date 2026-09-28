@@ -17,7 +17,7 @@ import (
 )
 
 // Version is set via -ldflags at release build time (no leading "v").
-var Version = "0.1.0"
+var Version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -168,6 +168,12 @@ func cmdCheck(args []string) int {
 	fmt.Printf("  host=%s port=%d workers=%d queue=%d\n",
 		cfg.Server.Host, cfg.Server.Port, cfg.Workers.Count, cfg.Queue.Capacity)
 	fmt.Printf("  php=%s script=%s\n", cfg.PHP.Binary, cfg.PHP.WorkerScript)
+	if resolved, err := cfg.ResolveWorkloads(); err == nil {
+		fmt.Printf("  workloads=%d\n", len(resolved))
+		for _, w := range resolved {
+			fmt.Printf("    - %s mode=%s workers=%d..%d\n", w.Name, w.Mode, w.Workers.Min, w.Workers.Max)
+		}
+	}
 	return 0
 }
 

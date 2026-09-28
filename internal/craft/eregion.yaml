@@ -162,3 +162,6 @@ readiness:
 liveness:
   enabled: true
   path: "/live"
+
+# Optional: workload_templates / workloads for consumer pools.
+# Legacy php+workers above remains the http workload when workloads is omitted.

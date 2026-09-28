@@ -162,3 +162,28 @@ readiness:
 liveness:
   enabled: true
   path: "/live"
+
+# Optional dynamic workloads (HTTP legacy above still works without this section).
+# workload_templates:
+#   io-consumer:
+#     mode: consumer
+#     workers:
+#       min: 1
+#       max: 8
+#     resources:
+#       class: io
+#       memory_mb: 128
+#     scaling:
+#       strategy: backlog
+#       scale_up_cooldown: 1s
+#       scale_down_idle_for: 30s
+# workloads:
+#   telemetry:
+#     template: io-consumer
+#     command:
+#       - php
+#       - vendor/bin/job-worker
+#       - --kernel=App\TelemetryKernel
+#     queue:
+#       transport: mqtt
+#       name: devices/+/temperature

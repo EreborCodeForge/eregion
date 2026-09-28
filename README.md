@@ -4,7 +4,9 @@ The lightweight Go application server for [MithrilPHP](https://github.com/Erebor
 
 > **Build with Mithril. Run in Eregion.**
 
-Eregion receives HTTP requests, keeps a fixed pool of persistent PHP workers warm, speaks length-prefixed MessagePack over Unix domain sockets, applies bounded backpressure, supervises crashes, and exposes health and Prometheus metrics.
+Eregion receives HTTP requests, supervises **dynamic workloads** (HTTP and consumers), keeps PHP workers warm, speaks length-prefixed MessagePack over Unix domain sockets for HTTP, applies bounded backpressure, scales worker pools, and exposes health and Prometheus metrics.
+
+HTTP is one workload mode. Consumer workloads run a configured argv command (for example `php vendor/bin/job-worker`) without opening an application HTTP listener on that pool.
 
 ## Install (recommended)
 
@@ -22,7 +24,7 @@ The canonical binary source is **GitHub Releases** — not `go build` from a clo
 Example (Linux amd64, pin a version):
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.0
 REPO=EreborCodeForge/eregion
 curl -fsSL -o eregion \
   "https://github.com/${REPO}/releases/download/v${VERSION}/eregion-linux-amd64"
@@ -36,7 +38,7 @@ chmod +x eregion
 Version contract (Forge-parseable):
 
 ```text
-eregion 0.2.0
+eregion 0.4.0
 protocol eregion/1
 ```
 
@@ -83,16 +85,46 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 
 ## Configuration notes
 
+- Legacy `php` + `workers` + `queue` config still works and is adapted to a single `http` workload
+- Optional `workload_templates` / `workloads` declare additional (or only) workloads; `command` is an argv array (no shell)
+- Consumer mode does not speak EREGION/1; the broker client stays in PHP/Mithril
+- Scaling strategies: `fixed`, `backlog` (needs a backlog provider; otherwise stays at `workers.min`), `resources`
+- Per-workload metrics: `eregion_workload_*{workload=...}` including desired/running/busy/draining/failed workers, restarts, and scale events
 - `workers.handshake_timeout` lives under `workers` (not `protocol`)
 - Transport and codec are fixed in v1: UDS + MessagePack
-- `queue.capacity` counts **waiting** requests only; max admitted = `workers.count + queue.capacity`
+- `queue.capacity` counts **waiting HTTP** requests only; max admitted = `workers.count + queue.capacity` (not a job queue)
 - `queue.capacity: 0` means no queue (execute only if a worker is free; otherwise immediate 503)
 - `operations.prefix` + relative endpoint paths (e.g. `/metrics`) resolve to `/_eregion/metrics`; absolute paths that already start with the prefix remain valid
 - Planned recycle (`max_requests`, `memory_limit_mb`, worker `meta.recycle`) is not a crash; crash loops use `restart_limit` / `restart_window` (slot Failed after more than `restart_limit` crashes in the window)
 - Restart backoff resets after a successful worker boot
 - `--workers` recomputes derived `queue.capacity` (`count * 8`) when capacity was not set explicitly in YAML
 - Unknown YAML fields fail startup
-- At startup Eregion **detects** available CPU/memory by resolving the **current process cgroup** (leaf under `/sys/fs/cgroup`, not only the cgroup root; falls back to `GOMAXPROCS` / `NumCPU` outside limits) and logs a **worker sizing recommendation**. This is advisory only: `workers.count` remains authoritative and is never auto-resized. `GOMAXPROCS` does **not** cap PHP worker processes. Oversized pools (`workers_per_cpu > 8`) emit WARN but still start. Metrics include `eregion_runtime_cpu_*`, `eregion_runtime_memory_limit_bytes`, `eregion_workers_per_cpu`, and `eregion_workers_recommended{,_min,_max}` (cached once; `eregion_workers_desired` is the configured count)
+- At startup Eregion **detects** available CPU/memory by resolving the **current process cgroup** (leaf under `/sys/fs/cgroup`, not only the cgroup root; falls back to `GOMAXPROCS` / `NumCPU` outside limits) and logs a **worker sizing recommendation**. This is advisory only: configured worker bounds remain authoritative. `GOMAXPROCS` does **not** cap PHP worker processes. Oversized pools (`workers_per_cpu > 8`) emit WARN but still start. Metrics include `eregion_runtime_cpu_*`, `eregion_runtime_memory_limit_bytes`, `eregion_workers_per_cpu`, and `eregion_workers_recommended{,_min,_max}` (cached once; `eregion_workers_desired` is the HTTP pool desired count)
+
+Example consumer workload (see also [`eregion-workloads-spec.md`](eregion-workloads-spec.md)):
+
+```yaml
+workload_templates:
+  io-consumer:
+    mode: consumer
+    workers: { min: 1, max: 8 }
+    resources: { class: io, memory_mb: 128 }
+    scaling:
+      strategy: backlog
+      scale_up_cooldown: 1s
+      scale_down_idle_for: 30s
+
+workloads:
+  telemetry:
+    template: io-consumer
+    command:
+      - php
+      - vendor/bin/job-worker
+      - --kernel=App\TelemetryKernel
+    queue:
+      transport: mqtt
+      name: devices/+/temperature
+```
 
 Saturation smoke: `scripts/stress.sh http://127.0.0.1:8080`
 

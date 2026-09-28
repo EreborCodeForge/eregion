@@ -23,12 +23,65 @@ type Config struct {
 	Readiness  EndpointConfig
 	Liveness   EndpointConfig
 
+	// WorkloadTemplates are operational templates keyed by name.
+	WorkloadTemplates map[string]WorkloadTemplateConfig
+	// Workloads are explicit workload definitions keyed by name.
+	Workloads map[string]WorkloadConfig
+	// HasExplicitWorkloads is true when the YAML declared a workloads section.
+	HasExplicitWorkloads bool
+
 	// Manifest is set from the CLI and forwarded to PHP workers.
 	Manifest string
 
 	// QueueCapacityDerived is true when queue.capacity came from workers.count*8
 	// (default or recompute) rather than an explicit YAML value.
 	QueueCapacityDerived bool
+}
+
+// WorkloadTemplateConfig is the YAML/runtime form of a workload template.
+type WorkloadTemplateConfig struct {
+	Mode      string                 `yaml:"mode"`
+	Workers   *WorkloadWorkersConfig `yaml:"workers"`
+	Resources *WorkloadResourcesConfig `yaml:"resources"`
+	Scaling   *WorkloadScalingConfig `yaml:"scaling"`
+}
+
+// WorkloadConfig is one named workload from YAML.
+type WorkloadConfig struct {
+	Template  string                 `yaml:"template"`
+	Mode      string                 `yaml:"mode"`
+	Command   []string               `yaml:"command"`
+	Queue     *WorkloadQueueConfig   `yaml:"queue"`
+	Workers   *WorkloadWorkersConfig `yaml:"workers"`
+	Resources *WorkloadResourcesConfig `yaml:"resources"`
+	Scaling   *WorkloadScalingConfig `yaml:"scaling"`
+}
+
+// WorkloadWorkersConfig is min/max workers.
+type WorkloadWorkersConfig struct {
+	Min *int `yaml:"min"`
+	Max *int `yaml:"max"`
+}
+
+// WorkloadResourcesConfig is resource class + memory.
+type WorkloadResourcesConfig struct {
+	Class     *string `yaml:"class"`
+	MemoryMB  *int    `yaml:"memory_mb"`
+}
+
+// WorkloadScalingConfig is scaling policy knobs.
+type WorkloadScalingConfig struct {
+	Strategy         *string `yaml:"strategy"`
+	ScaleUpCooldown  *string `yaml:"scale_up_cooldown"`
+	ScaleDownIdleFor *string `yaml:"scale_down_idle_for"`
+	AvgJobDuration   *string `yaml:"avg_job_duration"`
+	TargetDrainTime  *string `yaml:"target_drain_time"`
+}
+
+// WorkloadQueueConfig is broker metadata (not consumed by Eregion).
+type WorkloadQueueConfig struct {
+	Transport *string `yaml:"transport"`
+	Name      *string `yaml:"name"`
 }
 
 type ServerConfig struct {
@@ -180,6 +233,8 @@ func Default() Config {
 		Health:               EndpointConfig{Enabled: true, Path: "/health"},
 		Readiness:            EndpointConfig{Enabled: true, Path: "/ready"},
 		Liveness:             EndpointConfig{Enabled: true, Path: "/live"},
+		WorkloadTemplates:    map[string]WorkloadTemplateConfig{},
+		Workloads:            map[string]WorkloadConfig{},
 		QueueCapacityDerived: true,
 	}
 	_ = cfg.ResolveEndpoints()

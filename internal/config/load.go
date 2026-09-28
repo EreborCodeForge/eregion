@@ -12,19 +12,21 @@ import (
 
 // fileConfig mirrors the YAML schema with KnownFields-friendly decoding.
 type fileConfig struct {
-	Version    string         `yaml:"version"`
-	Server     fileServer     `yaml:"server"`
-	PHP        filePHP        `yaml:"php"`
-	Workers    fileWorkers    `yaml:"workers"`
-	Socket     fileSocket     `yaml:"socket"`
-	Protocol   fileProtocol   `yaml:"protocol"`
-	Queue      fileQueue      `yaml:"queue"`
-	Logging    fileLogging    `yaml:"logging"`
-	Operations fileOperations `yaml:"operations"`
-	Metrics    fileEndpoint   `yaml:"metrics"`
-	Health     fileEndpoint   `yaml:"health"`
-	Readiness  fileEndpoint   `yaml:"readiness"`
-	Liveness   fileEndpoint   `yaml:"liveness"`
+	Version           string                            `yaml:"version"`
+	Server            fileServer                        `yaml:"server"`
+	PHP               filePHP                           `yaml:"php"`
+	Workers           fileWorkers                       `yaml:"workers"`
+	Socket            fileSocket                        `yaml:"socket"`
+	Protocol          fileProtocol                      `yaml:"protocol"`
+	Queue             fileQueue                         `yaml:"queue"`
+	Logging           fileLogging                       `yaml:"logging"`
+	Operations        fileOperations                    `yaml:"operations"`
+	Metrics           fileEndpoint                      `yaml:"metrics"`
+	Health            fileEndpoint                      `yaml:"health"`
+	Readiness         fileEndpoint                      `yaml:"readiness"`
+	Liveness          fileEndpoint                      `yaml:"liveness"`
+	WorkloadTemplates map[string]WorkloadTemplateConfig `yaml:"workload_templates"`
+	Workloads         map[string]WorkloadConfig         `yaml:"workloads"`
 }
 
 type fileServer struct {
@@ -308,6 +310,14 @@ func applyFile(cfg *Config, file *fileConfig) error {
 	applyEndpoint(&cfg.Health, &file.Health)
 	applyEndpoint(&cfg.Readiness, &file.Readiness)
 	applyEndpoint(&cfg.Liveness, &file.Liveness)
+
+	if file.WorkloadTemplates != nil {
+		cfg.WorkloadTemplates = file.WorkloadTemplates
+	}
+	if file.Workloads != nil {
+		cfg.Workloads = file.Workloads
+		cfg.HasExplicitWorkloads = true
+	}
 
 	return nil
 }
