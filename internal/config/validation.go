@@ -118,5 +118,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if _, err := c.ResolveWorkloads(); err != nil {
+		return fmt.Errorf("workloads: %w", err)
+	}
+
 	return nil
 }

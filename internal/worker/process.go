@@ -16,8 +16,11 @@ import (
 	"github.com/EreborCodeForge/Eregion/internal/socket"
 )
 
-// ProcessSpecification describes how to spawn a PHP worker.
+// ProcessSpecification describes how to spawn a worker process.
 type ProcessSpecification struct {
+	// Consumer mode: full argv (no shell). When len(Command) > 0, Binary/WorkerScript are ignored.
+	Command []string
+
 	Binary           string
 	WorkerScript     string
 	WorkingDirectory string
@@ -38,20 +41,25 @@ type ProcessSpawner interface {
 // ExecSpawner uses os/exec.
 type ExecSpawner struct{}
 
-// Spawn starts the PHP worker process.
+// Spawn starts an HTTP PHP worker or a consumer argv process.
 func (ExecSpawner) Spawn(ctx context.Context, spec ProcessSpecification) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
-	args := []string{
-		spec.WorkerScript,
-		"--socket=" + spec.SocketPath,
-		"--worker-id=" + spec.WorkerID,
-		"--generation=" + strconv.FormatUint(spec.Generation, 10),
-		"--max-requests=" + strconv.Itoa(spec.MaxRequests),
-		"--memory-limit-mb=" + strconv.Itoa(spec.MemoryLimitMB),
+	var cmd *exec.Cmd
+	if len(spec.Command) > 0 {
+		cmd = exec.Command(spec.Command[0], spec.Command[1:]...)
+	} else {
+		args := []string{
+			spec.WorkerScript,
+			"--socket=" + spec.SocketPath,
+			"--worker-id=" + spec.WorkerID,
+			"--generation=" + strconv.FormatUint(spec.Generation, 10),
+			"--max-requests=" + strconv.Itoa(spec.MaxRequests),
+			"--memory-limit-mb=" + strconv.Itoa(spec.MemoryLimitMB),
+		}
+		if spec.Manifest != "" {
+			args = append(args, "--manifest="+spec.Manifest)
+		}
+		cmd = exec.Command(spec.Binary, args...)
 	}
-	if spec.Manifest != "" {
-		args = append(args, "--manifest="+spec.Manifest)
-	}
-	cmd := exec.Command(spec.Binary, args...)
 	cmd.Dir = spec.WorkingDirectory
 	cmd.Env = EnvironMerged(spec.Environment)
 	_ = ctx // startup bound is enforced by wait/dial timeouts in Starter.Start
@@ -180,7 +188,12 @@ func deadlineFrom(ctx context.Context) time.Time {
 	return dl
 }
 
-// Starter boots a worker process and completes handshake.
+// SlotStarter boots one worker generation for a pool slot.
+type SlotStarter interface {
+	Start(ctx context.Context, slot int, generation uint64, restartCount uint64) (*Worker, error)
+}
+
+// Starter boots an HTTP PHP worker process and completes EREGION handshake.
 type Starter struct {
 	cfg     config.Config
 	sockets *socket.Manager
@@ -189,7 +202,7 @@ type Starter struct {
 	version string
 }
 
-// NewStarter constructs a worker starter.
+// NewStarter constructs an HTTP worker starter.
 func NewStarter(cfg config.Config, sockets *socket.Manager, spawner ProcessSpawner, logger *slog.Logger, version string) *Starter {
 	if spawner == nil {
 		spawner = ExecSpawner{}
@@ -281,6 +294,89 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 	w.conn = protocol.NewConn(conn, s.cfg.Protocol.MaxFrameBytes)
 	w.State = StateIdle
 	s.logger.Info("worker ready", "worker_id", id, "generation", generation, "pid", w.PID)
+	return w, nil
+}
+
+// ConsumerStarter boots a consumer process from argv (no UDS / EREGION).
+type ConsumerStarter struct {
+	command          []string
+	workingDirectory string
+	environment      map[string]string
+	startupTimeout   time.Duration
+	shutdownTimeout  time.Duration
+	spawner          ProcessSpawner
+	logger           *slog.Logger
+}
+
+// NewConsumerStarter constructs a consumer process starter.
+func NewConsumerStarter(
+	command []string,
+	workingDirectory string,
+	environment map[string]string,
+	startupTimeout, shutdownTimeout time.Duration,
+	spawner ProcessSpawner,
+	logger *slog.Logger,
+) *ConsumerStarter {
+	if spawner == nil {
+		spawner = ExecSpawner{}
+	}
+	if workingDirectory == "" {
+		workingDirectory = "."
+	}
+	return &ConsumerStarter{
+		command:          append([]string(nil), command...),
+		workingDirectory: workingDirectory,
+		environment:      environment,
+		startupTimeout:   startupTimeout,
+		shutdownTimeout:  shutdownTimeout,
+		spawner:          spawner,
+		logger:           logger,
+	}
+}
+
+// Start launches a consumer generation for a slot.
+func (s *ConsumerStarter) Start(ctx context.Context, slot int, generation uint64, restartCount uint64) (*Worker, error) {
+	id := fmt.Sprintf("consumer-%d", slot)
+	w := &Worker{
+		ID:           id,
+		Slot:         slot,
+		Generation:   generation,
+		State:        StateStarting,
+		StartedAt:    time.Now(),
+		RestartCount: restartCount,
+		logger:       s.logger,
+	}
+	if len(s.command) == 0 {
+		w.State = StateFailed
+		return nil, fmt.Errorf("consumer %s: empty command", id)
+	}
+
+	spec := ProcessSpecification{
+		Command:          s.command,
+		WorkingDirectory: s.workingDirectory,
+		Environment:      s.environment,
+		WorkerID:         id,
+		Generation:       generation,
+	}
+
+	startCtx, cancel := context.WithTimeout(ctx, s.startupTimeout)
+	defer cancel()
+
+	cmd, stdout, stderr, err := s.spawner.Spawn(startCtx, spec)
+	if err != nil {
+		w.State = StateFailed
+		return nil, fmt.Errorf("spawn %s: %w", id, err)
+	}
+	w.cmd = cmd
+	if cmd.Process != nil {
+		w.PID = cmd.Process.Pid
+	}
+	go drainLog(s.logger, id, "stdout", stdout)
+	go drainLog(s.logger, id, "stderr", stderr)
+
+	// Consumer is ready once the OS process is running.
+	w.State = StateIdle
+	s.logger.Info("consumer ready", "worker_id", id, "generation", generation, "pid", w.PID, "command", s.command)
 	return w, nil
 }
 

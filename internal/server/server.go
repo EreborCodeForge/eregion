@@ -14,24 +14,29 @@ import (
 	"github.com/EreborCodeForge/Eregion/internal/config"
 	"github.com/EreborCodeForge/Eregion/internal/dispatcher"
 	"github.com/EreborCodeForge/Eregion/internal/lifecycle"
+	"github.com/EreborCodeForge/Eregion/internal/reconciler"
 	"github.com/EreborCodeForge/Eregion/internal/resources"
+	"github.com/EreborCodeForge/Eregion/internal/scaling"
 	"github.com/EreborCodeForge/Eregion/internal/sizing"
-	"github.com/EreborCodeForge/Eregion/internal/socket"
 	"github.com/EreborCodeForge/Eregion/internal/telemetry"
 	"github.com/EreborCodeForge/Eregion/internal/worker"
+	"github.com/EreborCodeForge/Eregion/internal/workload"
 )
 
-// Server is the top-level Eregion HTTP application server.
+// Server is the top-level Eregion workload supervisor.
 type Server struct {
 	cfg          config.Config
 	logger       *slog.Logger
 	version      string
-	pool         *worker.Pool
+	registry     *workload.Registry
+	pools        *worker.Manager
+	httpPool     *worker.Pool
 	metrics      *telemetry.Registry
 	runtimeRes   resources.RuntimeResources
 	workerSizing sizing.WorkerSizing
 	http         *http.Server
 	shuttingDown atomic.Bool
+	reconciler   *reconciler.Reconciler
 }
 
 // New constructs a server from config.
@@ -46,43 +51,102 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		cfg.Socket.Directory = sockDir
 	}
 
-	// Observe-and-advise only: never mutates cfg.Workers.Count.
-	runtimeRes := resources.SystemDetector{Logger: logger}.Detect()
-	workerSizing := sizing.Advisor{}.Analyze(runtimeRes, cfg.Workers.Count)
+	resolved, err := cfg.ResolveWorkloads()
+	if err != nil {
+		return nil, fmt.Errorf("resolve workloads: %w", err)
+	}
 
-	sockets := socket.NewManager(cfg.Socket.Directory, cfg.Socket.DirectoryPermissions, cfg.Socket.SocketPermissions)
-	pool := worker.NewPool(cfg, sockets, logger, version)
-	metrics := telemetry.NewRegistry(cfg, pool, runtimeRes, workerSizing)
-	pool.SetOnChange(func() {})
-	pool.SetMetrics(metrics)
+	// Observe-and-advise only: never mutates worker counts.
+	runtimeRes := resources.SystemDetector{Logger: logger}.Detect()
+	httpCount := cfg.Workers.Count
+	for _, w := range resolved {
+		if w.Mode == workload.ModeHTTP {
+			httpCount = w.Workers.Max
+			if httpCount < w.Workers.Min {
+				httpCount = w.Workers.Min
+			}
+			break
+		}
+	}
+	workerSizing := sizing.Advisor{}.Analyze(runtimeRes, httpCount)
+
+	registry := workload.NewRegistry()
+	for _, spec := range resolved {
+		if err := registry.Upsert(spec); err != nil {
+			return nil, err
+		}
+	}
+
+	pools := worker.NewManager(cfg, logger, version)
+	for _, spec := range resolved {
+		if _, err := pools.Ensure(spec); err != nil {
+			return nil, err
+		}
+	}
+
+	httpPool, hasHTTP := pools.HTTP()
+	metrics := telemetry.NewRegistry(cfg, pools, runtimeRes, workerSizing)
+	if hasHTTP {
+		httpPool.SetMetrics(metrics)
+		httpPool.SetScaleRecorder(metrics)
+	}
+	for _, p := range pools.List() {
+		p.SetScaleRecorder(metrics)
+		if p.Mode() == workload.ModeHTTP {
+			p.SetMetrics(metrics)
+		} else {
+			p.SetMetrics(metrics.ForWorkload(p.Name()))
+		}
+	}
+
+	strategies := scaling.NewRegistry(nil)
+	rec := reconciler.New(registry, pools, strategies, runtimeRes, logger)
 
 	mux := http.NewServeMux()
 	s := &Server{
 		cfg:          cfg,
 		logger:       logger,
 		version:      version,
-		pool:         pool,
+		registry:     registry,
+		pools:        pools,
+		httpPool:     httpPool,
 		metrics:      metrics,
 		runtimeRes:   runtimeRes,
 		workerSizing: workerSizing,
+		reconciler:   rec,
 	}
 
 	if cfg.Liveness.Enabled {
 		mux.HandleFunc(cfg.Liveness.Path, telemetry.LiveHandler())
 	}
-	if cfg.Readiness.Enabled {
-		mux.HandleFunc(cfg.Readiness.Path, telemetry.ReadyHandler(pool, cfg, s.IsShuttingDown))
-	}
-	if cfg.Health.Enabled {
-		mux.HandleFunc(cfg.Health.Path, telemetry.HealthHandler(pool, cfg))
+	if hasHTTP {
+		if cfg.Readiness.Enabled {
+			mux.HandleFunc(cfg.Readiness.Path, telemetry.ReadyHandler(httpPool, cfg, s.IsShuttingDown))
+		}
+		if cfg.Health.Enabled {
+			mux.HandleFunc(cfg.Health.Path, telemetry.HealthHandler(httpPool, cfg))
+		}
+	} else {
+		if cfg.Readiness.Enabled {
+			mux.HandleFunc(cfg.Readiness.Path, telemetry.ReadyHandlerMulti(pools, s.IsShuttingDown))
+		}
+		if cfg.Health.Enabled {
+			mux.HandleFunc(cfg.Health.Path, telemetry.HealthHandlerMulti(pools))
+		}
 	}
 	if cfg.Metrics.Enabled {
 		mux.HandleFunc(cfg.Metrics.Path, metrics.Handler())
 	}
 
-	disp := dispatcher.New(cfg, pool, logger, metrics)
-	pool.SetQueueWaitingProvider(disp.Waiting)
-	mux.Handle("/", disp)
+	if hasHTTP {
+		disp := dispatcher.New(cfg, httpPool, logger, metrics)
+		httpPool.SetQueueWaitingProvider(disp.Waiting)
+		mux.Handle("/", disp)
+	} else {
+		mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no http workload configured", http.StatusNotFound)
+		})
+	}
 
 	s.http = &http.Server{
 		Addr:              cfg.Addr(),
@@ -96,19 +160,27 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 	return s, nil
 }
 
-// Run starts workers and the HTTP server until ctx is cancelled.
+// Run starts workloads, reconciler, and the HTTP server until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	s.logger.Info("starting eregion", "version", s.version, "addr", s.cfg.Addr(), "workers", s.cfg.Workers.Count)
+	names := make([]string, 0)
+	for _, p := range s.pools.List() {
+		names = append(names, p.Name())
+	}
+	s.logger.Info("starting eregion", "version", s.version, "addr", s.cfg.Addr(), "workloads", names)
 	sizing.LogRuntimeResources(s.logger, s.runtimeRes, s.workerSizing)
 	sizing.LogMemoryEnvelope(s.logger, s.runtimeRes, s.cfg.Workers.Count, s.cfg.Workers.MemoryLimitMB)
 
-	if err := s.pool.Start(ctx); err != nil {
+	if err := s.pools.StartAll(ctx); err != nil {
 		return fmt.Errorf("start workers: %w", err)
 	}
 
+	recCtx, recCancel := context.WithCancel(ctx)
+	defer recCancel()
+	go s.reconciler.Run(recCtx)
+
 	ln, err := net.Listen("tcp", s.cfg.Addr())
 	if err != nil {
-		_ = s.pool.Shutdown(context.Background())
+		_ = s.pools.ShutdownAll(context.Background())
 		return fmt.Errorf("listen: %w", err)
 	}
 
@@ -125,9 +197,11 @@ func (s *Server) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		recCancel()
 		return s.shutdown()
 	case err := <-errCh:
-		_ = s.pool.Shutdown(context.Background())
+		recCancel()
+		_ = s.pools.ShutdownAll(context.Background())
 		return err
 	}
 }
@@ -142,7 +216,7 @@ func (s *Server) shutdown() error {
 	httpErr := s.http.Shutdown(shutdownCtx)
 	poolCtx, poolCancel := context.WithTimeout(context.Background(), s.cfg.Workers.ShutdownTimeout+time.Second)
 	defer poolCancel()
-	poolErr := s.pool.Shutdown(poolCtx)
+	poolErr := s.pools.ShutdownAll(poolCtx)
 	lifecycle.Cleanup(s.cfg.Socket.Directory)
 
 	if httpErr != nil {
