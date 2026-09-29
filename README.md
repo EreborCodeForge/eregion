@@ -101,7 +101,7 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 - Unknown YAML fields fail startup
 - At startup Eregion **detects** available CPU/memory by resolving the **current process cgroup** (leaf under `/sys/fs/cgroup`, not only the cgroup root; falls back to `GOMAXPROCS` / `NumCPU` outside limits) and logs a **worker sizing recommendation**. This is advisory only: configured worker bounds remain authoritative. `GOMAXPROCS` does **not** cap PHP worker processes. Oversized pools (`workers_per_cpu > 8`) emit WARN but still start. Metrics include `eregion_runtime_cpu_*`, `eregion_runtime_memory_limit_bytes`, `eregion_workers_per_cpu`, and `eregion_workers_recommended{,_min,_max}` (cached once; `eregion_workers_desired` is the HTTP pool desired count)
 
-Example consumer workload (see also [`eregion-workloads-spec.md`](eregion-workloads-spec.md)):
+Example consumer workload (see also [`docs/workloads-spec.md`](docs/workloads-spec.md)):
 
 ```yaml
 workload_templates:
