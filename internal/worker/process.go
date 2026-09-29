@@ -27,6 +27,7 @@ type ProcessSpecification struct {
 	Environment      map[string]string
 	Manifest         string
 	SocketPath       string
+	WorkloadName     string // consumer: EREGION_WORKLOAD
 	WorkerID         string
 	Generation       uint64
 	MaxRequests      int
@@ -44,8 +45,11 @@ type ExecSpawner struct{}
 // Spawn starts an HTTP PHP worker or a consumer argv process.
 func (ExecSpawner) Spawn(ctx context.Context, spec ProcessSpecification) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
 	var cmd *exec.Cmd
+	env := spec.Environment
 	if len(spec.Command) > 0 {
 		cmd = exec.Command(spec.Command[0], spec.Command[1:]...)
+		// Consumer processes receive Eregion metadata via environment (not UDS/EREGION protocol).
+		env = InjectConsumerMetadata(env, spec.WorkloadName, spec.WorkerID, spec.Generation)
 	} else {
 		args := []string{
 			spec.WorkerScript,
@@ -61,7 +65,7 @@ func (ExecSpawner) Spawn(ctx context.Context, spec ProcessSpecification) (*exec.
 		cmd = exec.Command(spec.Binary, args...)
 	}
 	cmd.Dir = spec.WorkingDirectory
-	cmd.Env = EnvironMerged(spec.Environment)
+	cmd.Env = EnvironMerged(env)
 	_ = ctx // startup bound is enforced by wait/dial timeouts in Starter.Start
 
 	stdout, err := cmd.StdoutPipe()
@@ -299,6 +303,7 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 
 // ConsumerStarter boots a consumer process from argv (no UDS / EREGION).
 type ConsumerStarter struct {
+	workload         string
 	command          []string
 	workingDirectory string
 	environment      map[string]string
@@ -310,6 +315,7 @@ type ConsumerStarter struct {
 
 // NewConsumerStarter constructs a consumer process starter.
 func NewConsumerStarter(
+	workload string,
 	command []string,
 	workingDirectory string,
 	environment map[string]string,
@@ -324,6 +330,7 @@ func NewConsumerStarter(
 		workingDirectory = "."
 	}
 	return &ConsumerStarter{
+		workload:         workload,
 		command:          append([]string(nil), command...),
 		workingDirectory: workingDirectory,
 		environment:      environment,
@@ -335,6 +342,10 @@ func NewConsumerStarter(
 }
 
 // Start launches a consumer generation for a slot.
+//
+// Operational readiness is "OS process running" (StateIdle). Without Mithril
+// telemetry, Eregion does not know broker idle/busy; StateIdle means process
+// running/ready, not broker idle.
 func (s *ConsumerStarter) Start(ctx context.Context, slot int, generation uint64, restartCount uint64) (*Worker, error) {
 	id := fmt.Sprintf("consumer-%d", slot)
 	w := &Worker{
@@ -354,7 +365,8 @@ func (s *ConsumerStarter) Start(ctx context.Context, slot int, generation uint64
 	spec := ProcessSpecification{
 		Command:          s.command,
 		WorkingDirectory: s.workingDirectory,
-		Environment:      s.environment,
+		Environment:      InjectConsumerMetadata(s.environment, s.workload, id, generation),
+		WorkloadName:     s.workload,
 		WorkerID:         id,
 		Generation:       generation,
 	}
@@ -374,7 +386,7 @@ func (s *ConsumerStarter) Start(ctx context.Context, slot int, generation uint64
 	go drainLog(s.logger, id, "stdout", stdout)
 	go drainLog(s.logger, id, "stderr", stderr)
 
-	// Consumer is ready once the OS process is running.
+	// Consumer is ready once the OS process is running (not broker-idle).
 	w.State = StateIdle
 	s.logger.Info("consumer ready", "worker_id", id, "generation", generation, "pid", w.PID, "command", s.command)
 	return w, nil
@@ -430,4 +442,16 @@ func terminateProcess(cmd *exec.Cmd, grace time.Duration) error {
 		_ = cmd.Process.Kill()
 	}
 	return nil
+}
+
+// terminateWorker closes the worker connection (if any) then applies the shared
+// SIGTERM → grace → Kill path used by scale-down, discard, and shutdown.
+func terminateWorker(w *Worker, grace time.Duration) {
+	if w == nil {
+		return
+	}
+	if w.conn != nil {
+		_ = w.conn.Close()
+	}
+	_ = terminateProcess(w.cmd, grace)
 }

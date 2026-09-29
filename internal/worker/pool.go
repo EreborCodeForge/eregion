@@ -160,6 +160,7 @@ func NewWorkloadPool(opts PoolOptions) *Pool {
 	switch opts.Mode {
 	case workload.ModeConsumer:
 		p.starter = NewConsumerStarter(
+			opts.Name,
 			opts.Command,
 			opts.Cfg.PHP.WorkingDirectory,
 			opts.Cfg.PHP.Environment,
@@ -534,14 +535,16 @@ func (p *Pool) SetDesired(n int) {
 	}
 	p.mu.Unlock()
 
+	grace := p.cfg.Workers.ShutdownTimeout
 	for _, w := range toDrain {
 		p.purgeIdle(w)
-		if w.conn != nil {
-			_ = w.conn.Close()
-		}
-		if w.cmd != nil && w.cmd.Process != nil {
-			_ = w.cmd.Process.Signal(syscallSIGTERM())
-		}
+		w := w
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			// Shared path with Shutdown/Discard: SIGTERM → shutdown_timeout → Kill.
+			terminateWorker(w, grace)
+		}()
 	}
 	for _, s := range toBoot {
 		go func(s *slot) {
@@ -817,6 +820,7 @@ func (p *Pool) HealthyCount() int {
 }
 
 // Shutdown stops accepting workers and terminates processes.
+// Uses the same SIGTERM → shutdown_timeout → Kill path as scale-down.
 func (p *Pool) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
 	p.stopping = true
@@ -825,21 +829,14 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		p.cancel()
 	}
 
+	grace := p.cfg.Workers.ShutdownTimeout
+
 	// Stop idle workers first.
 	for {
 		select {
 		case w := <-p.idle:
-			p.mu.Lock()
 			w.setState(StateStopped)
-			cmd := w.cmd
-			conn := w.conn
-			p.mu.Unlock()
-			if conn != nil {
-				_ = conn.Close()
-			}
-			if cmd != nil {
-				_ = terminateProcess(cmd, p.cfg.Workers.ShutdownTimeout)
-			}
+			terminateWorker(w, grace)
 		default:
 			goto doneIdle
 		}
@@ -847,15 +844,32 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 doneIdle:
 
 	p.mu.Lock()
+	remaining := make([]*Worker, 0, len(p.slots))
 	for _, s := range p.slots {
-		if s.worker != nil && s.worker.cmd != nil && s.worker.cmd.Process != nil {
-			_ = s.worker.cmd.Process.Signal(syscallSIGTERM())
+		if s.worker == nil {
+			continue
 		}
+		s.plannedExit = true
+		st := s.worker.getState()
+		if st != StateDraining && st != StateDead && st != StateStopped {
+			s.worker.setState(StateDraining)
+		}
+		remaining = append(remaining, s.worker)
 	}
 	p.mu.Unlock()
 
+	var twg sync.WaitGroup
+	for _, w := range remaining {
+		twg.Add(1)
+		go func(w *Worker) {
+			defer twg.Done()
+			terminateWorker(w, grace)
+		}(w)
+	}
+
 	done := make(chan struct{})
 	go func() {
+		twg.Wait()
 		p.wg.Wait()
 		close(done)
 	}()

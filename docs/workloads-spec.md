@@ -243,6 +243,16 @@ Falha em um workload não deve corromper outro.
 
 # Consumer Mode
 
+## Supervision ≠ message consumption
+
+```text
+Eregion  → supervises process lifecycle (start / restart / drain / shutdown)
+Mithril  → consumes jobs (JobTransport / poll / ack / retry / reject / broker)
+```
+
+Consumer supervision is **not** message consumption. Eregion does not open broker
+clients and does not implement job ACK/retry protocols.
+
 `consumer` deve:
 
 - não abrir listener HTTP da aplicação;
@@ -250,9 +260,32 @@ Falha em um workload não deve corromper outro.
 - aceitar `workers.min = 0`;
 - reiniciar crashes;
 - aplicar backoff;
-- fazer graceful drain;
+- fazer graceful drain (SIGTERM → `workers.shutdown_timeout` → force kill);
 - respeitar limites de CPU/memória;
-- manter métricas e health operacional.
+- manter métricas e health operacional;
+- injetar metadata de processo no ambiente do filho.
+
+### Consumer process environment
+
+Todo processo `mode: consumer` recebe (valores do Eregion sobrescrevem conflitos):
+
+```text
+EREGION_WORKLOAD=telemetry
+EREGION_WORKER_ID=consumer-2
+EREGION_GENERATION=4
+```
+
+Não há metadata de broker nessas variáveis. Sem telemetria Mithril, Eregion não
+conhece idle/busy de job: estado operacional mínimo é
+`starting` / `running` (`idle` = process ready) / `draining` / `failed` / `stopped`.
+
+### Restart semantics
+
+```text
+unexpected exit → crash → restart/backoff
+planned scale-down → no restart
+shutdown → no restart
+```
 
 Fluxo:
 
@@ -357,26 +390,26 @@ Estados mínimos:
 
 ```text
 starting
-idle
-busy
+idle      # HTTP: ready; consumer: process running/ready (não broker idle)
+busy      # HTTP only
 draining
 stopped
 failed
 ```
 
-Drain:
+Drain (scale-down e shutdown compartilham o mesmo caminho):
 
 ```text
 mark draining
 ↓
 SIGTERM
 ↓
-worker termina unidade atual
-↓
-espera shutdown timeout
+espera workers.shutdown_timeout
 ↓
 force kill somente se necessário
 ```
+
+Slots aposentados por scale-down não reiniciam. Crashes inesperados continuam com restart/backoff.
 
 # Backlog
 
