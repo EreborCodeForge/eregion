@@ -700,9 +700,10 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 			if reason == "" {
 				reason = "planned"
 			}
-			p.logger.Info("planned recycle", "worker_id", w.ID, "reason", reason)
+			metricReason := NormalizeRecycleReason(reason)
+			p.logger.Info("planned recycle", "worker_id", w.ID, "reason", metricReason)
 			if p.metrics != nil {
-				p.metrics.IncRecycle(reason)
+				p.metrics.IncRecycle(metricReason)
 			}
 		}
 		if conn != nil {

@@ -405,3 +405,89 @@ func TestStartupFailure(t *testing.T) {
 		t.Fatal("expected startup failure")
 	}
 }
+
+// Socket paths on Windows are limited to about 108 bytes, so these test names stay short.
+func TestWGRecycle(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "guard-recycle-worker.php"))
+	base := startServer(t, cfg)
+
+	first := getBody(t, base+"/")
+	if first.status != 200 || !bytes.Contains(first.body, []byte("guard-body gen=")) {
+		t.Fatalf("first status %d body %s", first.status, first.body)
+	}
+
+	var second httpResult
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		second = getBody(t, base+"/")
+		if second.status == 200 && !bytes.Equal(second.body, first.body) && bytes.Contains(second.body, []byte("guard-body gen=")) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if second.status != 200 || bytes.Equal(second.body, first.body) {
+		t.Fatalf("replacement body %s", second.body)
+	}
+
+	metrics := getBody(t, base+cfg.Metrics.Path)
+	if !bytes.Contains(metrics.body, []byte(`eregion_worker_recycles_total{reason="guard_state_violation"}`)) {
+		t.Fatalf("metrics missing guard reason: %s", metrics.body)
+	}
+	if bytes.Contains(metrics.body, []byte("UserContext")) {
+		t.Fatalf("metrics leaked a class name: %s", metrics.body)
+	}
+}
+
+func TestWGReason(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "unknown-recycle-worker.php"))
+	base := startServer(t, cfg)
+
+	resp := getBody(t, base+"/")
+	if resp.status != 200 || !bytes.Equal(resp.body, []byte("plain-body")) {
+		t.Fatalf("status %d body %s", resp.status, resp.body)
+	}
+
+	var metrics httpResult
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		metrics = getBody(t, base+cfg.Metrics.Path)
+		if bytes.Contains(metrics.body, []byte(`eregion_worker_recycles_total{reason="worker_requested"}`)) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if bytes.Contains(metrics.body, []byte("UserContext")) || bytes.Contains(metrics.body, []byte("Security")) {
+		t.Fatalf("metrics leaked recycle reason: %s", metrics.body)
+	}
+	if !bytes.Contains(metrics.body, []byte(`eregion_worker_recycles_total{reason="worker_requested"}`)) {
+		t.Fatalf("metrics = %s", metrics.body)
+	}
+}
+
+func TestWGLegacy(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "healthy-worker.php"))
+	base := startServer(t, cfg)
+	resp := getBody(t, base+"/")
+	if resp.status != 200 {
+		t.Fatalf("status %d body %s", resp.status, resp.body)
+	}
+}
+
+type httpResult struct {
+	status int
+	body   []byte
+}
+
+func getBody(t *testing.T, url string) httpResult {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return httpResult{status: resp.StatusCode, body: body}
+}
