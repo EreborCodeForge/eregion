@@ -15,10 +15,11 @@ import (
 )
 
 var (
-	ErrPoolShuttingDown = errors.New("worker pool is shutting down")
-	ErrNoWorkers        = errors.New("no workers available")
-	ErrAcquireTimeout   = errors.New("acquire worker timed out")
-	ErrSlotFailed       = errors.New("worker slot failed restart policy")
+	ErrPoolShuttingDown       = errors.New("worker pool is shutting down")
+	ErrNoWorkers              = errors.New("no workers available")
+	ErrAcquireTimeout         = errors.New("acquire worker timed out")
+	ErrSlotFailed             = errors.New("worker slot failed restart policy")
+	ErrGuardRestartSuppressed = errors.New("guard recycle restart suppressed")
 )
 
 // PoolSnapshot is an aggregate view of the pool.
@@ -72,6 +73,9 @@ type Pool struct {
 	onChange func()
 	// queueWaiting is set by the server to the dispatcher waiting counter (single source of truth).
 	queueWaiting func() int
+
+	breaker *GuardRecycleBreaker
+	started bool
 }
 
 type slot struct {
@@ -84,6 +88,8 @@ type slot struct {
 	plannedExit  bool
 	retired      bool // true when slot index is above desired; do not restart
 	monitorDone  chan struct{}
+	everBooted   bool
+	exitReason   string
 }
 
 // NewPool builds a fixed HTTP worker pool from legacy config.
@@ -116,6 +122,8 @@ type PoolOptions struct {
 	Max      int
 	MinReady int
 	Spawner  ProcessSpawner
+	// Starter overrides process creation. Tests use it to avoid real workers.
+	Starter SlotStarter
 }
 
 // NewWorkloadPool builds a pool for http or consumer mode.
@@ -155,22 +163,27 @@ func NewWorkloadPool(opts PoolOptions) *Pool {
 		minReady: opts.MinReady,
 		minW:     opts.Min,
 		maxW:     opts.Max,
+		breaker:  NewGuardRecycleBreaker(opts.Name, opts.Cfg.WorkerGuardRecycle, time.Now),
 	}
 
-	switch opts.Mode {
-	case workload.ModeConsumer:
-		p.starter = NewConsumerStarter(
-			opts.Name,
-			opts.Command,
-			opts.Cfg.PHP.WorkingDirectory,
-			opts.Cfg.PHP.Environment,
-			opts.Cfg.Workers.StartupTimeout,
-			opts.Cfg.Workers.ShutdownTimeout,
-			opts.Spawner,
-			p.logger,
-		)
-	default:
-		p.starter = NewStarter(opts.Cfg, opts.Sockets, opts.Spawner, p.logger, opts.Version)
+	if opts.Starter != nil {
+		p.starter = opts.Starter
+	} else {
+		switch opts.Mode {
+		case workload.ModeConsumer:
+			p.starter = NewConsumerStarter(
+				opts.Name,
+				opts.Command,
+				opts.Cfg.PHP.WorkingDirectory,
+				opts.Cfg.PHP.Environment,
+				opts.Cfg.Workers.StartupTimeout,
+				opts.Cfg.Workers.ShutdownTimeout,
+				opts.Spawner,
+				p.logger,
+			)
+		default:
+			p.starter = NewStarter(opts.Cfg, opts.Sockets, opts.Spawner, p.logger, opts.Version)
+		}
 	}
 	return p
 }
@@ -185,7 +198,14 @@ func (p *Pool) Mode() workload.WorkloadMode { return p.mode }
 func (p *Pool) SetOnChange(fn func()) { p.onChange = fn }
 
 // SetMetrics wires recycle/restart counters.
-func (p *Pool) SetMetrics(m PoolMetrics) { p.metrics = m }
+func (p *Pool) SetMetrics(m PoolMetrics) {
+	p.metrics = m
+	if p.breaker != nil {
+		if recorder, ok := m.(GuardRecycleRecorder); ok {
+			p.breaker.SetRecorder(recorder)
+		}
+	}
+}
 
 // SetScaleRecorder wires scale event counters.
 func (p *Pool) SetScaleRecorder(s ScaleEventRecorder) { p.scale = s }
@@ -227,6 +247,7 @@ func (p *Pool) Start(ctx context.Context) error {
 	p.mu.Unlock()
 
 	if n == 0 {
+		p.started = true
 		p.notify()
 		return nil
 	}
@@ -252,6 +273,7 @@ func (p *Pool) Start(ctx context.Context) error {
 		}(s)
 	}
 	wg.Wait()
+	p.started = true
 
 	// Require at least min_ready workers (HTTP). Consumer min=0 is allowed.
 	snap := p.Snapshot()
@@ -275,6 +297,22 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 		p.mu.Unlock()
 		return ErrPoolShuttingDown
 	}
+	p.mu.Unlock()
+
+	cause := p.classifyBoot(s)
+	permit := p.breaker.AllowBoot(cause)
+	if !permit.Allowed {
+		return ErrGuardRestartSuppressed
+	}
+
+	p.mu.Lock()
+	if p.stopping || s.retired || s.index > p.desired {
+		p.mu.Unlock()
+		if permit.Probe {
+			p.breaker.NoteProbeFailed()
+		}
+		return ErrPoolShuttingDown
+	}
 	s.generation++
 	gen := s.generation
 	restartCount := s.restartCount
@@ -282,6 +320,9 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 
 	w, err := p.starter.Start(p.ctx, s.index, gen, restartCount)
 	if err != nil {
+		if permit.Probe {
+			p.breaker.NoteProbeFailed()
+		}
 		p.mu.Lock()
 		s.worker = nil
 		if afterCrash {
@@ -299,6 +340,9 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	p.mu.Lock()
 	if p.stopping || s.retired || s.index > p.desired {
 		p.mu.Unlock()
+		if permit.Probe {
+			p.breaker.NoteProbeFailed()
+		}
 		if w.cmd != nil {
 			_ = terminateProcess(w.cmd, p.cfg.Workers.ShutdownTimeout)
 		}
@@ -306,9 +350,12 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	}
 	s.worker = w
 	s.plannedExit = false
+	s.everBooted = true
+	s.exitReason = ""
 	s.backoff.Reset()
 	s.monitorDone = make(chan struct{})
 	p.mu.Unlock()
+	p.breaker.NoteBoot(permit, gen)
 
 	p.wg.Add(1)
 	go p.monitor(s, w)
@@ -322,6 +369,29 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	}
 	p.notify()
 	return nil
+}
+
+func (p *Pool) classifyBoot(s *slot) BootCause {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !s.everBooted {
+		if p.started {
+			return BootScaleUp
+		}
+		return BootInitial
+	}
+	if IsGuardRecycleReason(s.exitReason) {
+		return BootGuardReplacement
+	}
+	return BootHealthyReplacement
+}
+
+// GuardBreakerState reports closed, open or half_open for metrics.
+func (p *Pool) GuardBreakerState() string {
+	if p.breaker == nil {
+		return "closed"
+	}
+	return p.breaker.State()
 }
 
 func (p *Pool) monitor(s *slot, w *Worker) {
@@ -454,6 +524,10 @@ func (p *Pool) scheduleRestart(s *slot, useBackoff bool) {
 			return
 		}
 		if err := p.bootSlot(s, useBackoff); err != nil {
+			if errors.Is(err, ErrGuardRestartSuppressed) {
+				p.logger.Info("guard recycle restart suppressed", "slot", s.index)
+				return
+			}
 			p.logger.Error("restart failed", "slot", s.index, "error", err)
 		}
 	}()
@@ -549,6 +623,10 @@ func (p *Pool) SetDesired(n int) {
 	for _, s := range toBoot {
 		go func(s *slot) {
 			if err := p.bootSlot(s, false); err != nil {
+				if errors.Is(err, ErrGuardRestartSuppressed) {
+					p.logger.Info("guard recycle restart suppressed", "slot", s.index)
+					return
+				}
 				p.logger.Error("scale-up boot failed", "slot", s.index, "error", err)
 			}
 		}(s)
@@ -679,6 +757,14 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 		}
 	}
 
+	if p.breaker != nil {
+		if recycle && IsGuardRecycleReason(reason) {
+			p.breaker.ObserveRecycle(reason, w.Generation)
+		} else if !recycle {
+			p.breaker.NoteHealthyRequest(w.Generation, w.StartedAt)
+		}
+	}
+
 	p.mu.Lock()
 	stopping := p.stopping
 	if w.Slot < 1 || w.Slot > len(p.slots) {
@@ -693,6 +779,9 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 	retired := s.retired || s.index > p.desired
 	if stopping || recycle || retired {
 		s.plannedExit = true
+		if recycle {
+			s.exitReason = reason
+		}
 		w.setState(StateDraining)
 		conn := w.conn
 		p.mu.Unlock()

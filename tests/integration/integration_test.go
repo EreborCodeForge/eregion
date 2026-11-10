@@ -438,6 +438,50 @@ func TestWGRecycle(t *testing.T) {
 	}
 }
 
+func TestWGStorm(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "guard-recycle-worker.php"))
+	cfg.WorkerGuardRecycle.MaxRecycles = 2
+	cfg.WorkerGuardRecycle.Cooldown = time.Hour
+	cfg.Workers.Count = 1
+	cfg.Workers.MinReady = 1
+	base := startServer(t, cfg)
+
+	first := getBody(t, base+"/")
+	if first.status != 200 || !bytes.Contains(first.body, []byte("guard-body gen=")) {
+		t.Fatalf("first status %d body %s", first.status, first.body)
+	}
+
+	var second httpResult
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		second = getBody(t, base+"/")
+		if second.status == 200 && !bytes.Equal(second.body, first.body) && bytes.Contains(second.body, []byte("guard-body gen=")) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if second.status != 200 || bytes.Equal(second.body, first.body) {
+		t.Fatalf("second status %d body %s", second.status, second.body)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	third := getBody(t, base+"/")
+	if third.status == 200 && !bytes.Equal(third.body, second.body) {
+		t.Fatalf("storm started another generation: %s", third.body)
+	}
+
+	metrics := getBody(t, base+cfg.Metrics.Path)
+	if !bytes.Contains(metrics.body, []byte(`eregion_worker_guard_breaker_state{workload="http",state="open"} 1`)) {
+		t.Fatalf("metrics missing open breaker: %s", metrics.body)
+	}
+	if !bytes.Contains(metrics.body, []byte(`eregion_worker_guard_recycle_events_total{workload="http",reason="guard_state_violation"}`)) {
+		t.Fatalf("metrics missing guard events: %s", metrics.body)
+	}
+	if bytes.Contains(metrics.body, []byte("UserContext")) || bytes.Contains(metrics.body, []byte("synthetic-secret-token")) {
+		t.Fatalf("metrics leaked application data: %s", metrics.body)
+	}
+}
+
 func TestWGReason(t *testing.T) {
 	cfg := testConfig(t, filepath.Join(fixturesDir(t), "unknown-recycle-worker.php"))
 	base := startServer(t, cfg)

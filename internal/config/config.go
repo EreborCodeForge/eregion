@@ -36,25 +36,29 @@ type Config struct {
 	// QueueCapacityDerived is true when queue.capacity came from workers.count*8
 	// (default or recompute) rather than an explicit YAML value.
 	QueueCapacityDerived bool
+
+	// WorkerGuardRecycle limits replacement boots caused by guard_state_violation.
+	// It does not inspect PHP state and does not change EREGION/1.
+	WorkerGuardRecycle GuardRecycleSafetyConfig
 }
 
 // WorkloadTemplateConfig is the YAML/runtime form of a workload template.
 type WorkloadTemplateConfig struct {
-	Mode      string                 `yaml:"mode"`
-	Workers   *WorkloadWorkersConfig `yaml:"workers"`
+	Mode      string                   `yaml:"mode"`
+	Workers   *WorkloadWorkersConfig   `yaml:"workers"`
 	Resources *WorkloadResourcesConfig `yaml:"resources"`
-	Scaling   *WorkloadScalingConfig `yaml:"scaling"`
+	Scaling   *WorkloadScalingConfig   `yaml:"scaling"`
 }
 
 // WorkloadConfig is one named workload from YAML.
 type WorkloadConfig struct {
-	Template  string                 `yaml:"template"`
-	Mode      string                 `yaml:"mode"`
-	Command   []string               `yaml:"command"`
-	Queue     *WorkloadQueueConfig   `yaml:"queue"`
-	Workers   *WorkloadWorkersConfig `yaml:"workers"`
+	Template  string                   `yaml:"template"`
+	Mode      string                   `yaml:"mode"`
+	Command   []string                 `yaml:"command"`
+	Queue     *WorkloadQueueConfig     `yaml:"queue"`
+	Workers   *WorkloadWorkersConfig   `yaml:"workers"`
 	Resources *WorkloadResourcesConfig `yaml:"resources"`
-	Scaling   *WorkloadScalingConfig `yaml:"scaling"`
+	Scaling   *WorkloadScalingConfig   `yaml:"scaling"`
 }
 
 // WorkloadWorkersConfig is min/max workers.
@@ -65,8 +69,8 @@ type WorkloadWorkersConfig struct {
 
 // WorkloadResourcesConfig is resource class + memory.
 type WorkloadResourcesConfig struct {
-	Class     *string `yaml:"class"`
-	MemoryMB  *int    `yaml:"memory_mb"`
+	Class    *string `yaml:"class"`
+	MemoryMB *int    `yaml:"memory_mb"`
 }
 
 // WorkloadScalingConfig is scaling policy knobs.
@@ -159,6 +163,18 @@ type EndpointConfig struct {
 	Path    string
 }
 
+// GuardRecycleSafetyConfig is the per-process policy for guard_state_violation storms.
+// Reasons are not taken from arbitrary PHP strings: only guard_state_violation counts.
+type GuardRecycleSafetyConfig struct {
+	Enabled                    bool
+	MaxRecycles                int
+	Window                     time.Duration
+	Cooldown                   time.Duration
+	HalfOpenMaxProbes          int
+	RecoverySuccessfulRequests int
+	RecoveryMinUptime          time.Duration
+}
+
 // Default returns safe local-development defaults (spec §7.3).
 func Default() Config {
 	workerCount := runtime.NumCPU()
@@ -236,6 +252,15 @@ func Default() Config {
 		WorkloadTemplates:    map[string]WorkloadTemplateConfig{},
 		Workloads:            map[string]WorkloadConfig{},
 		QueueCapacityDerived: true,
+		WorkerGuardRecycle: GuardRecycleSafetyConfig{
+			Enabled:                    true,
+			MaxRecycles:                3,
+			Window:                     30 * time.Second,
+			Cooldown:                   60 * time.Second,
+			HalfOpenMaxProbes:          1,
+			RecoverySuccessfulRequests: 20,
+			RecoveryMinUptime:          30 * time.Second,
+		},
 	}
 	_ = cfg.ResolveEndpoints()
 	return cfg

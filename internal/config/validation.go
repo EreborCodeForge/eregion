@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Validate checks the resolved configuration.
@@ -121,6 +122,32 @@ func (c *Config) Validate() error {
 	if _, err := c.ResolveWorkloads(); err != nil {
 		return fmt.Errorf("workloads: %w", err)
 	}
+	if err := c.validateGuardRecycle(); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func (c *Config) validateGuardRecycle() error {
+	g := c.WorkerGuardRecycle
+	if g.MaxRecycles < 1 || g.MaxRecycles > 100 {
+		return fmt.Errorf("worker_guard_recycle_safety.max_recycles must be between 1 and 100")
+	}
+	if g.Window < time.Second || g.Window > 10*time.Minute {
+		return fmt.Errorf("worker_guard_recycle_safety.window must be between 1s and 10m")
+	}
+	if g.Cooldown < time.Second || g.Cooldown > 30*time.Minute {
+		return fmt.Errorf("worker_guard_recycle_safety.cooldown must be between 1s and 30m")
+	}
+	if g.HalfOpenMaxProbes < 1 || g.HalfOpenMaxProbes > 5 {
+		return fmt.Errorf("worker_guard_recycle_safety.half_open_max_probes must be between 1 and 5")
+	}
+	if g.RecoverySuccessfulRequests < 1 || g.RecoverySuccessfulRequests > 10000 {
+		return fmt.Errorf("worker_guard_recycle_safety.recovery_successful_requests must be between 1 and 10000")
+	}
+	if g.RecoveryMinUptime < 0 || g.RecoveryMinUptime > time.Hour {
+		return fmt.Errorf("worker_guard_recycle_safety.recovery_min_uptime must be between 0 and 1h")
+	}
 	return nil
 }

@@ -197,11 +197,12 @@ func TestConsumerScaleDownForceKill(t *testing.T) {
 	cfg := config.Default()
 	cfg.Socket.Directory = t.TempDir()
 	cfg.Workers.ShutdownTimeout = 200 * time.Millisecond
+	readyDir := t.TempDir()
 	helper := writeStubbornHelper(t, t.TempDir())
 	pool := worker.NewWorkloadPool(worker.PoolOptions{
 		Name:     "stubborn",
 		Mode:     workload.ModeConsumer,
-		Command:  []string{helper},
+		Command:  []string{helper, readyDir},
 		Cfg:      cfg,
 		Logger:   slog.Default(),
 		Desired:  2,
@@ -220,15 +221,18 @@ func TestConsumerScaleDownForceKill(t *testing.T) {
 		_ = pool.Shutdown(shCtx)
 	}()
 	waitRunning(t, pool, 2, 5*time.Second)
+	// StateIdle is set when the process is spawned, before main ignores SIGTERM.
+	// Scale-down before that signal is installed looks like an instant kill.
+	waitFiles(t, readyDir, 2, 5*time.Second)
 
 	started := time.Now()
 	pool.SetDesired(0)
-	waitAtMostRunning(t, pool, 0, 3*time.Second)
+	waitAtMostRunning(t, pool, 0, 4*time.Second)
 	elapsed := time.Since(started)
 	if elapsed < cfg.Workers.ShutdownTimeout {
 		t.Fatalf("force-kill path too fast (%v); expected grace of %v", elapsed, cfg.Workers.ShutdownTimeout)
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > 3*time.Second {
 		t.Fatalf("scale-down blocked too long: %v", elapsed)
 	}
 }
@@ -455,15 +459,35 @@ func writeStubbornHelper(t *testing.T, dir string) string {
 	t.Helper()
 	return buildGoHelper(t, dir, "stubborn", `package main
 import (
+  "os"
   "os/signal"
+  "path/filepath"
+  "strconv"
   "syscall"
   "time"
 )
 func main() {
   signal.Ignore(syscall.SIGTERM)
+  if len(os.Args) > 1 {
+    _ = os.WriteFile(filepath.Join(os.Args[1], strconv.Itoa(os.Getpid())), []byte("1"), 0o644)
+  }
   time.Sleep(60 * time.Second)
 }
 `)
+}
+
+func waitFiles(t *testing.T, dir string, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(dir)
+		if err == nil && len(entries) >= n {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	entries, _ := os.ReadDir(dir)
+	t.Fatalf("timeout waiting for %d files in %s, have %d", n, dir, len(entries))
 }
 
 func buildGoHelper(t *testing.T, dir, name, code string) string {

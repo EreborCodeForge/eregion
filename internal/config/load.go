@@ -12,21 +12,22 @@ import (
 
 // fileConfig mirrors the YAML schema with KnownFields-friendly decoding.
 type fileConfig struct {
-	Version           string                            `yaml:"version"`
-	Server            fileServer                        `yaml:"server"`
-	PHP               filePHP                           `yaml:"php"`
-	Workers           fileWorkers                       `yaml:"workers"`
-	Socket            fileSocket                        `yaml:"socket"`
-	Protocol          fileProtocol                      `yaml:"protocol"`
-	Queue             fileQueue                         `yaml:"queue"`
-	Logging           fileLogging                       `yaml:"logging"`
-	Operations        fileOperations                    `yaml:"operations"`
-	Metrics           fileEndpoint                      `yaml:"metrics"`
-	Health            fileEndpoint                      `yaml:"health"`
-	Readiness         fileEndpoint                      `yaml:"readiness"`
-	Liveness          fileEndpoint                      `yaml:"liveness"`
-	WorkloadTemplates map[string]WorkloadTemplateConfig `yaml:"workload_templates"`
-	Workloads         map[string]WorkloadConfig         `yaml:"workloads"`
+	Version            string                            `yaml:"version"`
+	Server             fileServer                        `yaml:"server"`
+	PHP                filePHP                           `yaml:"php"`
+	Workers            fileWorkers                       `yaml:"workers"`
+	Socket             fileSocket                        `yaml:"socket"`
+	Protocol           fileProtocol                      `yaml:"protocol"`
+	Queue              fileQueue                         `yaml:"queue"`
+	Logging            fileLogging                       `yaml:"logging"`
+	Operations         fileOperations                    `yaml:"operations"`
+	Metrics            fileEndpoint                      `yaml:"metrics"`
+	Health             fileEndpoint                      `yaml:"health"`
+	Readiness          fileEndpoint                      `yaml:"readiness"`
+	Liveness           fileEndpoint                      `yaml:"liveness"`
+	WorkloadTemplates  map[string]WorkloadTemplateConfig `yaml:"workload_templates"`
+	Workloads          map[string]WorkloadConfig         `yaml:"workloads"`
+	WorkerGuardRecycle *fileGuardRecycle                 `yaml:"worker_guard_recycle_safety"`
 }
 
 type fileServer struct {
@@ -106,6 +107,17 @@ type fileOperations struct {
 type fileEndpoint struct {
 	Enabled *bool   `yaml:"enabled"`
 	Path    *string `yaml:"path"`
+}
+
+type fileGuardRecycle struct {
+	Enabled                    *bool    `yaml:"enabled"`
+	Reasons                    []string `yaml:"reasons"`
+	MaxRecycles                *int     `yaml:"max_recycles"`
+	Window                     *string  `yaml:"window"`
+	Cooldown                   *string  `yaml:"cooldown"`
+	HalfOpenMaxProbes          *int     `yaml:"half_open_max_probes"`
+	RecoverySuccessfulRequests *int     `yaml:"recovery_successful_requests"`
+	RecoveryMinUptime          *string  `yaml:"recovery_min_uptime"`
 }
 
 // Load reads and validates a YAML configuration file, merging with defaults.
@@ -318,7 +330,43 @@ func applyFile(cfg *Config, file *fileConfig) error {
 		cfg.Workloads = file.Workloads
 		cfg.HasExplicitWorkloads = true
 	}
+	if err := applyGuardRecycle(cfg, file.WorkerGuardRecycle); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func applyGuardRecycle(cfg *Config, file *fileGuardRecycle) error {
+	if file == nil {
+		return nil
+	}
+	if file.Enabled != nil {
+		cfg.WorkerGuardRecycle.Enabled = *file.Enabled
+	}
+	for _, reason := range file.Reasons {
+		if reason != "guard_state_violation" {
+			return fmt.Errorf("worker_guard_recycle_safety.reasons only allows guard_state_violation")
+		}
+	}
+	if file.MaxRecycles != nil {
+		cfg.WorkerGuardRecycle.MaxRecycles = *file.MaxRecycles
+	}
+	if err := applyDuration(&cfg.WorkerGuardRecycle.Window, file.Window, "worker_guard_recycle_safety.window"); err != nil {
+		return err
+	}
+	if err := applyDuration(&cfg.WorkerGuardRecycle.Cooldown, file.Cooldown, "worker_guard_recycle_safety.cooldown"); err != nil {
+		return err
+	}
+	if file.HalfOpenMaxProbes != nil {
+		cfg.WorkerGuardRecycle.HalfOpenMaxProbes = *file.HalfOpenMaxProbes
+	}
+	if file.RecoverySuccessfulRequests != nil {
+		cfg.WorkerGuardRecycle.RecoverySuccessfulRequests = *file.RecoverySuccessfulRequests
+	}
+	if err := applyDuration(&cfg.WorkerGuardRecycle.RecoveryMinUptime, file.RecoveryMinUptime, "worker_guard_recycle_safety.recovery_min_uptime"); err != nil {
+		return err
+	}
 	return nil
 }
 

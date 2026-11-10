@@ -39,6 +39,7 @@ func TestWorkloadMetricLabels(t *testing.T) {
 		`eregion_workload_desired_workers{workload="telemetry"}`,
 		`eregion_workload_scale_events_total{workload="telemetry",direction="up"}`,
 		`eregion_workload_restarts_total{workload="telemetry"}`,
+		`eregion_worker_guard_breaker_state{workload="telemetry",state="closed"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q\n%s", want, body)

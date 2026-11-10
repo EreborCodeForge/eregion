@@ -30,18 +30,21 @@ type Registry struct {
 	workersRecommendedMin float64
 	workersRecommendedMax float64
 
-	requestsTotal  atomic.Uint64
-	inFlight       atomic.Int64
-	errorsTotal    sync.Map // kind -> *atomic.Uint64
-	queueRejects   atomic.Uint64
-	durationCount  atomic.Uint64
-	durationSum    atomic.Uint64 // milliseconds
-	queueWaitCount atomic.Uint64
-	queueWaitSum   atomic.Uint64 // milliseconds
-	recycleTotal   sync.Map
-	restartTotal   atomic.Uint64
-	restartByWL    sync.Map // workload -> *atomic.Uint64
-	scaleByWL      sync.Map // "name|direction" -> *atomic.Uint64
+	requestsTotal   atomic.Uint64
+	inFlight        atomic.Int64
+	errorsTotal     sync.Map // kind -> *atomic.Uint64
+	queueRejects    atomic.Uint64
+	durationCount   atomic.Uint64
+	durationSum     atomic.Uint64 // milliseconds
+	queueWaitCount  atomic.Uint64
+	queueWaitSum    atomic.Uint64 // milliseconds
+	recycleTotal    sync.Map
+	restartTotal    atomic.Uint64
+	restartByWL     sync.Map // workload -> *atomic.Uint64
+	scaleByWL       sync.Map // "name|direction" -> *atomic.Uint64
+	guardRecycle    sync.Map // "workload|reason" -> *atomic.Uint64
+	guardSuppressed sync.Map // workload -> *atomic.Uint64
+	guardHalfOpen   sync.Map // "workload|result" -> *atomic.Uint64
 }
 
 // NewRegistry creates metrics backed by the pool manager and cached resource sizing.
@@ -83,6 +86,8 @@ func (r *Registry) IncError(kind string) {
 	v.(*atomic.Uint64).Add(1)
 }
 func (r *Registry) IncRecycle(reason string) {
+	// Planned recycles stay on eregion_worker_recycles_total.
+	// guard_state_violation is also counted on eregion_worker_guard_recycle_events_total.
 	v, _ := r.recycleTotal.LoadOrStore(reason, &atomic.Uint64{})
 	v.(*atomic.Uint64).Add(1)
 }
@@ -107,6 +112,32 @@ func (r *Registry) IncScale(workload, direction string) {
 	v.(*atomic.Uint64).Add(1)
 }
 
+// IncGuardRecycle counts a guard_state_violation recycle. Other reasons collapse to other.
+func (r *Registry) IncGuardRecycle(workload, reason string) {
+	reason = worker.NormalizeGuardReason(reason)
+	key := workload + "|" + reason
+	v, _ := r.guardRecycle.LoadOrStore(key, &atomic.Uint64{})
+	v.(*atomic.Uint64).Add(1)
+}
+
+// IncGuardSuppressed counts a boot the breaker refused.
+func (r *Registry) IncGuardSuppressed(workload string) {
+	v, _ := r.guardSuppressed.LoadOrStore(workload, &atomic.Uint64{})
+	v.(*atomic.Uint64).Add(1)
+}
+
+// IncGuardHalfOpen counts a half-open trial result: admitted, success or failure.
+func (r *Registry) IncGuardHalfOpen(workload, result string) {
+	switch result {
+	case "admitted", "success", "failure":
+	default:
+		result = "failure"
+	}
+	key := workload + "|" + result
+	v, _ := r.guardHalfOpen.LoadOrStore(key, &atomic.Uint64{})
+	v.(*atomic.Uint64).Add(1)
+}
+
 // ForWorkload returns a PoolMetrics scoped to a workload name.
 func (r *Registry) ForWorkload(name string) worker.PoolMetrics {
 	return workloadMetrics{reg: r, name: name}
@@ -121,6 +152,13 @@ func (m workloadMetrics) IncRecycle(reason string) { m.reg.IncRecycle(reason) }
 func (m workloadMetrics) IncRestart() {
 	m.reg.restartTotal.Add(1)
 	m.reg.incRestartWL(m.name)
+}
+func (m workloadMetrics) IncGuardRecycle(workload, reason string) {
+	m.reg.IncGuardRecycle(workload, reason)
+}
+func (m workloadMetrics) IncGuardSuppressed(workload string) { m.reg.IncGuardSuppressed(workload) }
+func (m workloadMetrics) IncGuardHalfOpen(workload, result string) {
+	m.reg.IncGuardHalfOpen(workload, result)
 }
 
 // Handler serves /metrics in Prometheus text format.
@@ -208,6 +246,43 @@ func (r *Registry) Handler() http.HandlerFunc {
 			fmt.Fprintf(&b, "eregion_workload_scale_events_total{workload=%q,direction=%q} %d\n", parts[0], parts[1], v.(*atomic.Uint64).Load())
 			return true
 		})
+
+		fmt.Fprintf(&b, "# TYPE eregion_worker_guard_recycle_events_total counter\n")
+		r.guardRecycle.Range(func(k, v any) bool {
+			parts := strings.SplitN(k.(string), "|", 2)
+			if len(parts) != 2 {
+				return true
+			}
+			fmt.Fprintf(&b, "eregion_worker_guard_recycle_events_total{workload=%q,reason=%q} %d\n", parts[0], parts[1], v.(*atomic.Uint64).Load())
+			return true
+		})
+		fmt.Fprintf(&b, "# TYPE eregion_worker_guard_restart_suppressed_total counter\n")
+		r.guardSuppressed.Range(func(k, v any) bool {
+			fmt.Fprintf(&b, "eregion_worker_guard_restart_suppressed_total{workload=%q} %d\n", k, v.(*atomic.Uint64).Load())
+			return true
+		})
+		fmt.Fprintf(&b, "# TYPE eregion_worker_guard_half_open_attempts_total counter\n")
+		r.guardHalfOpen.Range(func(k, v any) bool {
+			parts := strings.SplitN(k.(string), "|", 2)
+			if len(parts) != 2 {
+				return true
+			}
+			fmt.Fprintf(&b, "eregion_worker_guard_half_open_attempts_total{workload=%q,result=%q} %d\n", parts[0], parts[1], v.(*atomic.Uint64).Load())
+			return true
+		})
+		fmt.Fprintf(&b, "# TYPE eregion_worker_guard_breaker_state gauge\n")
+		if r.pools != nil {
+			for _, p := range r.pools.List() {
+				current := p.GuardBreakerState()
+				for _, state := range []string{"closed", "open", "half_open"} {
+					val := 0
+					if current == state {
+						val = 1
+					}
+					fmt.Fprintf(&b, "eregion_worker_guard_breaker_state{workload=%q,state=%q} %d\n", p.Name(), state, val)
+				}
+			}
+		}
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write([]byte(b.String()))

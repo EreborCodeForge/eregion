@@ -109,3 +109,28 @@ func findRepoRoot(t *testing.T) string {
 		dir = parent
 	}
 }
+
+func TestGuardRecycleSafetyConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "eregion.yaml")
+	body := []byte("version: \"1\"\nworker_guard_recycle_safety:\n  enabled: false\n  max_recycles: 2\n  window: 10s\n  cooldown: 5s\n  half_open_max_probes: 1\n  recovery_successful_requests: 4\n  recovery_min_uptime: 1s\n  reasons: [guard_state_violation]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkerGuardRecycle.Enabled || cfg.WorkerGuardRecycle.MaxRecycles != 2 {
+		t.Fatalf("safety=%+v", cfg.WorkerGuardRecycle)
+	}
+
+	bad := []byte("version: \"1\"\nworker_guard_recycle_safety:\n  reasons: [user-42]\n")
+	badPath := filepath.Join(dir, "bad.yaml")
+	if err := os.WriteFile(badPath, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(badPath); err == nil {
+		t.Fatal("expected unknown guard reason to fail")
+	}
+}
