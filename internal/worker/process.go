@@ -425,21 +425,15 @@ func terminateProcess(cmd *exec.Cmd, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	if cmd.ProcessState != nil {
+	proc := cmd.Process
+	if err := proc.Signal(syscallSIGTERM()); err != nil {
+		_ = proc.Kill()
 		return nil
 	}
-	if err := cmd.Process.Signal(syscallSIGTERM()); err != nil {
-		return cmd.Process.Kill()
-	}
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		if cmd.ProcessState != nil {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if cmd.ProcessState == nil {
-		_ = cmd.Process.Kill()
+	// Wait owns ProcessState. Do not read it from this goroutine.
+	time.Sleep(grace)
+	if processStillAlive(proc) {
+		_ = proc.Kill()
 	}
 	return nil
 }

@@ -247,7 +247,9 @@ func (p *Pool) Start(ctx context.Context) error {
 	p.mu.Unlock()
 
 	if n == 0 {
+		p.mu.Lock()
 		p.started = true
+		p.mu.Unlock()
 		p.notify()
 		return nil
 	}
@@ -273,7 +275,9 @@ func (p *Pool) Start(ctx context.Context) error {
 		}(s)
 	}
 	wg.Wait()
+	p.mu.Lock()
 	p.started = true
+	p.mu.Unlock()
 
 	// Require at least min_ready workers (HTTP). Consumer min=0 is allowed.
 	snap := p.Snapshot()
