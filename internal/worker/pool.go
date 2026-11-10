@@ -76,6 +76,10 @@ type Pool struct {
 
 	breaker *GuardRecycleBreaker
 	started bool
+	// guardRetryArmed is the single cooldown waiter for this pool.
+	guardRetryArmed bool
+	// after waits for a guard-probe delay. Tests replace it. Nil uses time.After.
+	after func(time.Duration) <-chan time.Time
 }
 
 type slot struct {
@@ -90,6 +94,8 @@ type slot struct {
 	monitorDone  chan struct{}
 	everBooted   bool
 	exitReason   string
+	// guardDeferred is an empty slot whose guard replacement was held by the breaker.
+	guardDeferred bool
 }
 
 // NewPool builds a fixed HTTP worker pool from legacy config.
@@ -306,6 +312,9 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	cause := p.classifyBoot(s)
 	permit := p.breaker.AllowBoot(cause)
 	if !permit.Allowed {
+		if cause == BootGuardReplacement {
+			p.deferGuardBoot(s)
+		}
 		return ErrGuardRestartSuppressed
 	}
 
@@ -317,6 +326,7 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 		}
 		return ErrPoolShuttingDown
 	}
+	s.guardDeferred = false
 	s.generation++
 	gen := s.generation
 	restartCount := s.restartCount
@@ -359,7 +369,7 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	s.backoff.Reset()
 	s.monitorDone = make(chan struct{})
 	p.mu.Unlock()
-	p.breaker.NoteBoot(permit, gen)
+	p.breaker.NoteBoot(permit, s.index, gen)
 
 	p.wg.Add(1)
 	go p.monitor(s, w)
@@ -535,6 +545,97 @@ func (p *Pool) scheduleRestart(s *slot, useBackoff bool) {
 			p.logger.Error("restart failed", "slot", s.index, "error", err)
 		}
 	}()
+}
+
+// deferGuardBoot remembers a slot that still needs one guard replacement
+// and arms a single wait until the breaker cooldown elapses.
+func (p *Pool) deferGuardBoot(s *slot) {
+	p.mu.Lock()
+	s.guardDeferred = true
+	stopping := p.stopping
+	p.mu.Unlock()
+	if stopping {
+		return
+	}
+	p.armGuardProbeRetry()
+}
+
+func (p *Pool) armGuardProbeRetry() {
+	if p.ctx == nil {
+		return
+	}
+	delay, ok := p.breaker.ProbeRetryDelay()
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	if p.guardRetryArmed || p.stopping {
+		p.mu.Unlock()
+		return
+	}
+	p.guardRetryArmed = true
+	p.mu.Unlock()
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		fired := false
+		if p.after != nil {
+			select {
+			case <-p.ctx.Done():
+			case <-p.after(delay):
+				fired = true
+			}
+		} else {
+			timer := time.NewTimer(delay)
+			select {
+			case <-p.ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+				fired = true
+			}
+		}
+		p.mu.Lock()
+		p.guardRetryArmed = false
+		stopping := p.stopping
+		p.mu.Unlock()
+		if !fired || stopping {
+			return
+		}
+		p.resumeDeferredGuardBoots()
+	}()
+}
+
+// resumeDeferredGuardBoots starts suppressed guard replacements.
+// While half-open it stops after the one admitted probe. A closed breaker
+// may fill the remaining deferred slots. It does not spin if the boot is
+// still suppressed: bootSlot arms the next cooldown wait itself.
+func (p *Pool) resumeDeferredGuardBoots() {
+	p.mu.Lock()
+	if p.stopping {
+		p.mu.Unlock()
+		return
+	}
+	pending := make([]*slot, 0, len(p.slots))
+	for _, s := range p.slots {
+		if s.guardDeferred && s.worker == nil && !s.retired && s.index <= p.desired {
+			pending = append(pending, s)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, s := range pending {
+		if p.breaker.ProbeBusy() {
+			return
+		}
+		err := p.bootSlot(s, false)
+		if errors.Is(err, ErrGuardRestartSuppressed) {
+			return
+		}
+		if err == nil && p.breaker.ProbeBusy() {
+			return
+		}
+	}
 }
 
 // SetDesired reconciles pool size toward n (clamped to min/max).
@@ -763,9 +864,9 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 
 	if p.breaker != nil {
 		if recycle && IsGuardRecycleReason(reason) {
-			p.breaker.ObserveRecycle(reason, w.Generation)
-		} else if !recycle {
-			p.breaker.NoteHealthyRequest(w.Generation, w.StartedAt)
+			p.breaker.ObserveRecycle(reason, w.Slot, w.Generation)
+		} else if !recycle && p.breaker.NoteHealthyRequest(w.Slot, w.Generation, w.StartedAt) {
+			p.resumeDeferredGuardBoots()
 		}
 	}
 

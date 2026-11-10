@@ -62,8 +62,21 @@ type GuardRecycleBreaker struct {
 	events           []time.Time
 	cooldownUntil    time.Time
 	halfOpenInFlight int
-	probeGeneration  uint64
-	probeSuccesses   int
+	// probe is the only generation allowed to prove recovery.
+	// Slot and generation together: each slot has its own generation counter.
+	probe          workerKey
+	probeSuccesses int
+}
+
+// workerKey is one process. Generation numbers restart per slot, so neither
+// field identifies a worker by itself.
+type workerKey struct {
+	slot       int
+	generation uint64
+}
+
+func (k workerKey) matches(slot int, generation uint64) bool {
+	return k.slot > 0 && k.generation > 0 && k.slot == slot && k.generation == generation
 }
 
 // NewGuardRecycleBreaker builds a closed breaker for one workload.
@@ -106,8 +119,8 @@ func NormalizeGuardReason(reason string) string {
 }
 
 // ObserveRecycle counts a finished guard_state_violation recycle.
-// The caller has already retired that worker. generation identifies the process.
-func (b *GuardRecycleBreaker) ObserveRecycle(reason string, generation uint64) {
+// The caller has already retired that worker. slot and generation identify the process.
+func (b *GuardRecycleBreaker) ObserveRecycle(reason string, slot int, generation uint64) {
 	if b == nil || !b.cfg.Enabled || !IsGuardRecycleReason(reason) {
 		return
 	}
@@ -117,14 +130,13 @@ func (b *GuardRecycleBreaker) ObserveRecycle(reason string, generation uint64) {
 	b.advanceLocked(now)
 	b.emitRecycleLocked()
 
-	if b.state == breakerHalfOpen && (b.probeGeneration == 0 || generation == b.probeGeneration) {
-		b.failProbeLocked(now)
+	if b.state == breakerHalfOpen {
+		if b.probe.matches(slot, generation) {
+			b.failProbeLocked(now)
+		}
 		return
 	}
 	if b.state == breakerOpen {
-		return
-	}
-	if b.state == breakerHalfOpen {
 		return
 	}
 
@@ -183,13 +195,13 @@ func (b *GuardRecycleBreaker) AllowBoot(cause BootCause) BootPermit {
 	}
 }
 
-// NoteBoot records the generation that holds the half-open token.
-func (b *GuardRecycleBreaker) NoteBoot(permit BootPermit, generation uint64) {
-	if b == nil || !permit.Probe {
+// NoteBoot records the slot and generation that hold the half-open token.
+func (b *GuardRecycleBreaker) NoteBoot(permit BootPermit, slot int, generation uint64) {
+	if b == nil || !permit.Probe || slot <= 0 || generation == 0 {
 		return
 	}
 	b.mu.Lock()
-	b.probeGeneration = generation
+	b.probe = workerKey{slot: slot, generation: generation}
 	b.probeSuccesses = 0
 	b.mu.Unlock()
 }
@@ -209,30 +221,62 @@ func (b *GuardRecycleBreaker) NoteProbeFailed() {
 
 // NoteHealthyRequest counts a finished request on the half-open probe worker.
 // Recovery requires both the request count and the minimum uptime. A live PID is not enough.
-func (b *GuardRecycleBreaker) NoteHealthyRequest(generation uint64, started time.Time) {
-	if b == nil || !b.cfg.Enabled || generation == 0 {
-		return
+// The bool is true only on the transition back to closed.
+func (b *GuardRecycleBreaker) NoteHealthyRequest(slot int, generation uint64, started time.Time) bool {
+	if b == nil || !b.cfg.Enabled || slot <= 0 || generation == 0 {
+		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
 	b.advanceLocked(now)
-	if b.state != breakerHalfOpen || generation != b.probeGeneration {
-		return
+	if b.state != breakerHalfOpen || !b.probe.matches(slot, generation) {
+		return false
 	}
 	b.probeSuccesses++
 	if b.probeSuccesses < b.cfg.RecoverySuccessfulRequests {
-		return
+		return false
 	}
 	if now.Before(started.Add(b.cfg.RecoveryMinUptime)) {
-		return
+		return false
 	}
 	b.state = breakerClosed
 	b.events = nil
 	b.halfOpenInFlight = 0
-	b.probeGeneration = 0
+	b.probe = workerKey{}
 	b.probeSuccesses = 0
 	b.emitHalfOpenLocked("success")
+	return true
+}
+
+// ProbeBusy reports a half-open trial that already holds the token.
+// A breaker that only just became half-open, with no boot recorded, is not busy.
+func (b *GuardRecycleBreaker) ProbeBusy() bool {
+	if b == nil || !b.cfg.Enabled {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state == breakerHalfOpen && (b.halfOpenInFlight > 0 || b.probe.slot > 0)
+}
+
+// ProbeRetryDelay is how long a suppressed guard replacement should wait
+// before one automatic attempt. ok is false when waiting would spin:
+// the breaker is not open, or the cooldown has already elapsed.
+func (b *GuardRecycleBreaker) ProbeRetryDelay() (time.Duration, bool) {
+	if b == nil || !b.cfg.Enabled {
+		return 0, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != breakerOpen {
+		return 0, false
+	}
+	delay := b.cooldownUntil.Sub(b.now())
+	if delay <= 0 {
+		return 0, false
+	}
+	return delay, true
 }
 
 // State returns closed, open or half_open and applies a due cooldown transition.
@@ -250,7 +294,7 @@ func (b *GuardRecycleBreaker) advanceLocked(now time.Time) {
 	if b.state == breakerOpen && !now.Before(b.cooldownUntil) {
 		b.state = breakerHalfOpen
 		b.halfOpenInFlight = 0
-		b.probeGeneration = 0
+		b.probe = workerKey{}
 		b.probeSuccesses = 0
 	}
 }
@@ -259,7 +303,7 @@ func (b *GuardRecycleBreaker) openLocked(now time.Time) {
 	b.state = breakerOpen
 	b.cooldownUntil = now.Add(b.cfg.Cooldown)
 	b.halfOpenInFlight = 0
-	b.probeGeneration = 0
+	b.probe = workerKey{}
 	b.probeSuccesses = 0
 	b.events = nil
 }
