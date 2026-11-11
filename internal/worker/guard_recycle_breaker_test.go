@@ -439,6 +439,11 @@ func TestGuardProbeStartsAfterCooldownWithoutExternalCall(t *testing.T) {
 	if starter.n.Load() != 0 {
 		t.Fatalf("started before cooldown: %d", starter.n.Load())
 	}
+	// armGuardProbeRetry invokes after from its own goroutine.
+	armed := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(armed) {
+		time.Sleep(time.Millisecond)
+	}
 	if calls.Load() != 1 || time.Duration(delay.Load()) != time.Hour {
 		t.Fatalf("calls=%d delay=%s", calls.Load(), time.Duration(delay.Load()))
 	}

@@ -7,9 +7,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -506,6 +510,289 @@ func TestWGReason(t *testing.T) {
 	if !bytes.Contains(metrics.body, []byte(`eregion_worker_recycles_total{reason="worker_requested"}`)) {
 		t.Fatalf("metrics = %s", metrics.body)
 	}
+}
+
+func TestWGRecover(t *testing.T) {
+	script := filepath.Join(fixturesDir(t), "guard-recover-worker.php")
+	cfg := testConfig(t, script)
+	cfg.Workers.Count = 1
+	cfg.Workers.MinReady = 1
+	cfg.Workers.RestartLimit = 20
+	cfg.Workers.AcquireTimeout = 400 * time.Millisecond
+	cfg.WorkerGuardRecycle.MaxRecycles = 2
+	cfg.WorkerGuardRecycle.Window = 30 * time.Second
+	cfg.WorkerGuardRecycle.Cooldown = 2 * time.Second
+	cfg.WorkerGuardRecycle.HalfOpenMaxProbes = 1
+	cfg.WorkerGuardRecycle.RecoverySuccessfulRequests = 4
+	cfg.WorkerGuardRecycle.RecoveryMinUptime = time.Second
+	base, stop := startManaged(t, cfg)
+
+	pids := map[string]string{}
+	var violated time.Time
+	var recovered time.Time
+	var closed []byte
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, ok := tryGet(base + "/"); ok && got.status == 200 {
+			gen, pid, parsed := parseRecover(got.body)
+			if !parsed {
+				t.Fatalf("body %q", got.body)
+			}
+			if prev, exists := pids[gen]; exists && prev != pid {
+				t.Fatalf("generation %s changed process %s -> %s", gen, prev, pid)
+			}
+			pids[gen] = pid
+			if gen == "2" && violated.IsZero() {
+				violated = time.Now()
+			}
+			if gen == "3" && recovered.IsZero() {
+				recovered = time.Now()
+			}
+			if gen != "1" && gen != "2" && gen != "3" {
+				t.Fatalf("unexpected generation %s pids=%v", gen, pids)
+			}
+		}
+		if metrics, ok := tryGet(base + cfg.Metrics.Path); ok && !recovered.IsZero() {
+			success, _ := promValue(metrics.body, `eregion_worker_guard_half_open_attempts_total{workload="http",result="success"}`)
+			if success == 1 && bytes.Contains(metrics.body, []byte(`eregion_worker_guard_breaker_state{workload="http",state="closed"} 1`)) {
+				closed = metrics.body
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if violated.IsZero() || pids["1"] == "" || pids["2"] == "" {
+		t.Fatalf("breaker was not opened by two real violations: %+v", pids)
+	}
+	if recovered.IsZero() || pids["3"] == "" || closed == nil {
+		t.Fatalf("cooldown did not recover a healthy worker: pids=%v\n%s", pids, breakerLines(closed))
+	}
+	gap := recovered.Sub(violated)
+	if gap < 1500*time.Millisecond {
+		t.Fatalf("probe returned %s after the second violation; restart loop", gap)
+	}
+	if pids["1"] == pids["2"] || pids["1"] == pids["3"] || pids["2"] == pids["3"] {
+		t.Fatalf("compromised worker was reused: %+v", pids)
+	}
+	admitted, _ := promValue(closed, `eregion_worker_guard_half_open_attempts_total{workload="http",result="admitted"}`)
+	if admitted != 1 {
+		t.Fatalf("half-open admissions=%d, want 1\n%s", admitted, breakerLines(closed))
+	}
+	if bytes.Contains(closed, []byte(`result="failure"`)) {
+		t.Fatalf("probe failed\n%s", breakerLines(closed))
+	}
+	restarts, ok := promValue(closed, "eregion_worker_restarts_total")
+	if !ok {
+		t.Fatalf("missing restart counter\n%s", breakerLines(closed))
+	}
+	time.Sleep(1200 * time.Millisecond)
+	for i := 0; i < 8; i++ {
+		got, ok := tryGet(base + "/")
+		if !ok || got.status != 200 {
+			t.Fatalf("recovered worker stopped serving: %+v", got)
+		}
+		gen, pid, parsed := parseRecover(got.body)
+		if !parsed || gen != "3" || pid != pids["3"] {
+			t.Fatalf("recovered worker was replaced: gen=%s pid=%s want pid=%s", gen, pid, pids["3"])
+		}
+	}
+	later, ok := tryGet(base + cfg.Metrics.Path)
+	if !ok {
+		t.Fatal("metrics unavailable after recovery")
+	}
+	restartsLater, _ := promValue(later.body, "eregion_worker_restarts_total")
+	if restartsLater != restarts {
+		t.Fatalf("restarts grew after recovery: %d -> %d", restarts, restartsLater)
+	}
+	t.Logf("pids=%v gap=%s restarts=%d", pids, gap, restarts)
+
+	started := time.Now()
+	stop()
+	if elapsed := time.Since(started); elapsed > 8*time.Second {
+		t.Fatalf("shutdown took %s", elapsed)
+	}
+	if hits := workerProcesses(script); len(hits) != 0 {
+		t.Fatalf("orphan workers after shutdown: %v", hits)
+	}
+}
+
+func TestWGShutdown(t *testing.T) {
+	script := filepath.Join(fixturesDir(t), "guard-recycle-worker.php")
+	cfg := testConfig(t, script)
+	cfg.Workers.Count = 1
+	cfg.Workers.MinReady = 1
+	cfg.Workers.RestartLimit = 20
+	cfg.Workers.AcquireTimeout = 400 * time.Millisecond
+	cfg.WorkerGuardRecycle.MaxRecycles = 1
+	cfg.WorkerGuardRecycle.Cooldown = 45 * time.Second
+	base, stop := startManaged(t, cfg)
+
+	deadline := time.Now().Add(10 * time.Second)
+	opened := false
+	for time.Now().Before(deadline) {
+		_, _ = tryGet(base + "/")
+		metrics, ok := tryGet(base + cfg.Metrics.Path)
+		if ok && bytes.Contains(metrics.body, []byte(`eregion_worker_guard_breaker_state{workload="http",state="open"} 1`)) {
+			opened = true
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if !opened {
+		t.Fatal("breaker did not open")
+	}
+
+	started := time.Now()
+	stop()
+	elapsed := time.Since(started)
+	t.Logf("shutdown_during_cooldown=%s", elapsed)
+	if elapsed > 8*time.Second {
+		t.Fatalf("shutdown waited on the cooldown timer: %s", elapsed)
+	}
+	if hits := workerProcesses(script); len(hits) != 0 {
+		t.Fatalf("orphan workers after shutdown: %v", hits)
+	}
+}
+
+func startManaged(t *testing.T, cfg config.Config) (string, func()) {
+	t.Helper()
+	cfg.Server.Port = pickTCPPort(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv, err := server.New(cfg, logger, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run(ctx)
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-errCh:
+			case <-time.After(15 * time.Second):
+				t.Errorf("shutdown did not return")
+			}
+		})
+	}
+	t.Cleanup(stop)
+
+	baseURL := "http://" + cfg.Addr()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(baseURL + cfg.Liveness.Path)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				resp2, err2 := http.Get(baseURL + cfg.Readiness.Path)
+				if err2 == nil {
+					resp2.Body.Close()
+					if resp2.StatusCode == 200 {
+						return baseURL, stop
+					}
+				}
+			}
+		}
+		select {
+		case err := <-errCh:
+			errCh <- err
+			t.Fatalf("server exited early: %v", err)
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("server not ready")
+	return "", stop
+}
+
+func tryGet(url string) (httpResult, bool) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return httpResult{}, false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return httpResult{}, false
+	}
+	return httpResult{status: resp.StatusCode, body: body}, true
+}
+
+func parseRecover(body []byte) (string, string, bool) {
+	text := strings.TrimSpace(string(body))
+	const prefix = "recover gen="
+	if !strings.HasPrefix(text, prefix) {
+		return "", "", false
+	}
+	gen, pid, ok := strings.Cut(strings.TrimPrefix(text, prefix), " pid=")
+	if !ok || gen == "" || pid == "" {
+		return "", "", false
+	}
+	return gen, pid, true
+}
+
+func promValue(body []byte, name string) (int, bool) {
+	prefix := []byte(name + " ")
+	labeled := []byte(name)
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if bytes.HasPrefix(line, prefix) || (strings.Contains(name, "{") && bytes.HasPrefix(line, labeled)) {
+			fields := bytes.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(string(fields[len(fields)-1]))
+			if err != nil {
+				continue
+			}
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func breakerLines(body []byte) string {
+	var b strings.Builder
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.Contains(line, "guard_") || strings.Contains(line, "restarts_total") || strings.Contains(line, "recycles_total") {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func workerProcesses(script string) []string {
+	needle := filepath.Base(script)
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("powershell", "-NoProfile", "-Command", `Get-CimInstance Win32_Process -Filter "Name = 'php.exe'" | ForEach-Object { $_.CommandLine }`).CombinedOutput()
+		if err != nil {
+			return []string{err.Error()}
+		}
+		var hits []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, needle) {
+				hits = append(hits, strings.TrimSpace(line))
+			}
+		}
+		return hits
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return []string{err.Error()}
+	}
+	var hits []string
+	for _, entry := range entries {
+		cmd, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
+		if err != nil || !bytes.Contains(cmd, []byte(needle)) {
+			continue
+		}
+		hits = append(hits, entry.Name())
+	}
+	return hits
 }
 
 func TestWGLegacy(t *testing.T) {
