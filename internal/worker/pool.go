@@ -35,10 +35,12 @@ type PoolSnapshot struct {
 	Capacity int
 }
 
-// PoolMetrics records recycle and restart events.
+// PoolMetrics records recycle, restart, and planned-replacement events.
 type PoolMetrics interface {
 	IncRecycle(reason string)
 	IncRestart()
+	// ObserveReplace records the gap from a planned recycle until the replacement is idle.
+	ObserveReplace(reason string, seconds float64)
 }
 
 // ScaleEventRecorder records scale up/down events (optional).
@@ -96,6 +98,10 @@ type slot struct {
 	exitReason   string
 	// guardDeferred is an empty slot whose guard replacement was held by the breaker.
 	guardDeferred bool
+	// replaceStarted is when a planned recycle removed this slot from service.
+	// Zero means the next boot is not a measured replacement.
+	replaceStarted time.Time
+	replaceReason  string
 }
 
 // NewPool builds a fixed HTTP worker pool from legacy config.
@@ -375,14 +381,41 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	go p.monitor(s, w)
 
 	if p.mode == workload.ModeHTTP {
+		published := false
 		select {
 		case p.idle <- w:
+			published = true
 		default:
 			p.logger.Warn("idle channel full on boot", "worker_id", w.ID)
 		}
+		p.observeReplace(s, published)
 	}
 	p.notify()
 	return nil
+}
+
+// observeReplace emits one sample when a planned replacement re-enters the idle pool.
+// Initial boots, scale-ups, and crash restarts have no replaceStarted and emit nothing.
+// A worker that cannot be published is not sampled, and the marker is cleared so a
+// later crash restart is not reported as this planned recycle.
+func (p *Pool) observeReplace(s *slot, published bool) {
+	p.mu.Lock()
+	reason, started, ok := s.takeReplaceSample()
+	p.mu.Unlock()
+	if !ok || !published || p.metrics == nil {
+		return
+	}
+	p.metrics.ObserveReplace(reason, time.Since(started).Seconds())
+}
+
+func (s *slot) takeReplaceSample() (reason string, started time.Time, ok bool) {
+	if s.replaceStarted.IsZero() {
+		return "", time.Time{}, false
+	}
+	reason, started = s.replaceReason, s.replaceStarted
+	s.replaceStarted = time.Time{}
+	s.replaceReason = ""
+	return reason, started, true
 }
 
 func (p *Pool) classifyBoot(s *slot) BootCause {
@@ -886,6 +919,12 @@ func (p *Pool) Release(w *Worker, resp *protocol.ResponseEnvelope) {
 		s.plannedExit = true
 		if recycle {
 			s.exitReason = reason
+			metricReason := reason
+			if metricReason == "" {
+				metricReason = "planned"
+			}
+			s.replaceReason = NormalizeRecycleReason(metricReason)
+			s.replaceStarted = time.Now()
 		}
 		w.setState(StateDraining)
 		conn := w.conn

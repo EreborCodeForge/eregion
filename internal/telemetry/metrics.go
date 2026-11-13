@@ -3,6 +3,7 @@ package telemetry
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,9 +36,12 @@ type Registry struct {
 	errorsTotal     sync.Map // kind -> *atomic.Uint64
 	queueRejects    atomic.Uint64
 	durationCount   atomic.Uint64
-	durationSum     atomic.Uint64 // milliseconds
+	durationSum     atomic.Uint64 // nanoseconds
 	queueWaitCount  atomic.Uint64
-	queueWaitSum    atomic.Uint64 // milliseconds
+	queueWaitSum    atomic.Uint64 // nanoseconds
+	roundtripCount  atomic.Uint64
+	roundtripSum    atomic.Uint64 // nanoseconds
+	replaceDuration sync.Map      // reason -> *nsAccum
 	recycleTotal    sync.Map
 	restartTotal    atomic.Uint64
 	restartByWL     sync.Map // workload -> *atomic.Uint64
@@ -74,13 +78,57 @@ func (r *Registry) IncInFlight()    { r.inFlight.Add(1) }
 func (r *Registry) DecInFlight()    { r.inFlight.Add(-1) }
 func (r *Registry) IncQueueReject() { r.queueRejects.Add(1) }
 func (r *Registry) ObserveDuration(sec float64) {
-	r.durationCount.Add(1)
-	r.durationSum.Add(uint64(sec * 1000))
+	observeNanos(&r.durationCount, &r.durationSum, sec)
 }
 func (r *Registry) ObserveQueueWait(sec float64) {
-	r.queueWaitCount.Add(1)
-	r.queueWaitSum.Add(uint64(sec * 1000))
+	observeNanos(&r.queueWaitCount, &r.queueWaitSum, sec)
 }
+func (r *Registry) ObserveRoundtrip(sec float64) {
+	observeNanos(&r.roundtripCount, &r.roundtripSum, sec)
+}
+
+// ObserveReplace records one completed planned replacement.
+// seconds is the gap from the worker leaving service until its replacement is idle.
+func (r *Registry) ObserveReplace(reason string, sec float64) {
+	if reason == "" {
+		reason = "planned"
+	}
+	v, _ := r.replaceDuration.LoadOrStore(reason, &nsAccum{})
+	v.(*nsAccum).observe(sec)
+}
+
+// nsAccum is a count and a nanosecond sum for one labeled series.
+type nsAccum struct {
+	count atomic.Uint64
+	sum   atomic.Uint64
+}
+
+func (a *nsAccum) observe(sec float64) {
+	observeNanos(&a.count, &a.sum, sec)
+}
+
+// observeNanos counts one sample. Negative, NaN, and infinite values add nothing
+// to the sum so sub-millisecond samples are not truncated to zero.
+func observeNanos(count, sum *atomic.Uint64, sec float64) {
+	count.Add(1)
+	if sec <= 0 || math.IsNaN(sec) || math.IsInf(sec, 0) {
+		return
+	}
+	ns := math.Round(sec * 1e9)
+	if math.IsNaN(ns) || math.IsInf(ns, 0) || ns <= 0 {
+		return
+	}
+	// Stay inside the exact integer range of float64 so the uint64 conversion is defined.
+	if ns > float64(1<<53) {
+		ns = float64(1 << 53)
+	}
+	sum.Add(uint64(ns))
+}
+
+func nanosToSeconds(ns uint64) float64 {
+	return float64(ns) / 1e9
+}
+
 func (r *Registry) IncError(kind string) {
 	v, _ := r.errorsTotal.LoadOrStore(kind, &atomic.Uint64{})
 	v.(*atomic.Uint64).Add(1)
@@ -149,6 +197,9 @@ type workloadMetrics struct {
 }
 
 func (m workloadMetrics) IncRecycle(reason string) { m.reg.IncRecycle(reason) }
+func (m workloadMetrics) ObserveReplace(reason string, sec float64) {
+	m.reg.ObserveReplace(reason, sec)
+}
 func (m workloadMetrics) IncRestart() {
 	m.reg.restartTotal.Add(1)
 	m.reg.incRestartWL(m.name)
@@ -177,10 +228,13 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeCounter("eregion_http_queue_rejects_total", r.queueRejects.Load())
 		fmt.Fprintf(&b, "# TYPE eregion_http_request_duration_seconds summary\n")
 		fmt.Fprintf(&b, "eregion_http_request_duration_seconds_count %d\n", r.durationCount.Load())
-		fmt.Fprintf(&b, "eregion_http_request_duration_seconds_sum %g\n", float64(r.durationSum.Load())/1000)
+		fmt.Fprintf(&b, "eregion_http_request_duration_seconds_sum %g\n", nanosToSeconds(r.durationSum.Load()))
 		fmt.Fprintf(&b, "# TYPE eregion_queue_wait_duration_seconds summary\n")
 		fmt.Fprintf(&b, "eregion_queue_wait_duration_seconds_count %d\n", r.queueWaitCount.Load())
-		fmt.Fprintf(&b, "eregion_queue_wait_duration_seconds_sum %g\n", float64(r.queueWaitSum.Load())/1000)
+		fmt.Fprintf(&b, "eregion_queue_wait_duration_seconds_sum %g\n", nanosToSeconds(r.queueWaitSum.Load()))
+		fmt.Fprintf(&b, "# TYPE eregion_worker_roundtrip_duration_seconds summary\n")
+		fmt.Fprintf(&b, "eregion_worker_roundtrip_duration_seconds_count %d\n", r.roundtripCount.Load())
+		fmt.Fprintf(&b, "eregion_worker_roundtrip_duration_seconds_sum %g\n", nanosToSeconds(r.roundtripSum.Load()))
 
 		r.errorsTotal.Range(func(k, v any) bool {
 			fmt.Fprintf(&b, "eregion_http_errors_total{kind=%q} %d\n", k, v.(*atomic.Uint64).Load())
@@ -207,6 +261,7 @@ func (r *Registry) Handler() http.HandlerFunc {
 			writeGauge("eregion_worker_failed_slots", float64(snap.Failed))
 		}
 
+		writeGauge("eregion_workers_max_requests", float64(r.cfg.Workers.MaxRequests))
 		writeGauge("eregion_workers_per_cpu", r.workersPerCPU)
 		writeGauge("eregion_workers_recommended", r.workersRecommended)
 		writeGauge("eregion_workers_recommended_min", r.workersRecommendedMin)
@@ -214,6 +269,14 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeCounter("eregion_worker_restarts_total", r.restartTotal.Load())
 		r.recycleTotal.Range(func(k, v any) bool {
 			fmt.Fprintf(&b, "eregion_worker_recycles_total{reason=%q} %d\n", k, v.(*atomic.Uint64).Load())
+			return true
+		})
+		fmt.Fprintf(&b, "# TYPE eregion_worker_replace_duration_seconds summary\n")
+		r.replaceDuration.Range(func(k, v any) bool {
+			acc := v.(*nsAccum)
+			reason := k.(string)
+			fmt.Fprintf(&b, "eregion_worker_replace_duration_seconds_count{reason=%q} %d\n", reason, acc.count.Load())
+			fmt.Fprintf(&b, "eregion_worker_replace_duration_seconds_sum{reason=%q} %g\n", reason, nanosToSeconds(acc.sum.Load()))
 			return true
 		})
 

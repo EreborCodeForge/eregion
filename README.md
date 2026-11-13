@@ -24,7 +24,7 @@ The canonical binary source is **GitHub Releases** — not `go build` from a clo
 Example (Linux amd64, pin a version):
 
 ```bash
-VERSION=0.4.0
+VERSION=0.4.1
 REPO=EreborCodeForge/eregion
 curl -fsSL -o eregion \
   "https://github.com/${REPO}/releases/download/v${VERSION}/eregion-linux-amd64"
@@ -38,11 +38,13 @@ chmod +x eregion
 Version contract (Forge-parseable):
 
 ```text
-eregion 0.4.0
+eregion 0.4.1
 protocol eregion/1
 ```
 
 **Protocol:** `eregion/1` (EREGION/1). Production must pin a release tag; do not rely on `latest` alone.
+
+**0.4.1** keeps the same protocol, admission, and recycle order. It fixes duration metrics (sub-millisecond samples are no longer truncated) and adds `eregion_worker_roundtrip_duration_seconds`, `eregion_worker_replace_duration_seconds{reason=...}`, and `eregion_workers_max_requests`. The VPS and Forge must install this GitHub Release asset into `.mithril/bin/eregion`. Do not benchmark or deploy a binary produced with `go build` from a clone.
 
 ## Requirements (from source)
 

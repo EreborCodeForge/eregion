@@ -28,6 +28,7 @@ type Metrics interface {
 	IncInFlight()
 	ObserveDuration(seconds float64)
 	ObserveQueueWait(seconds float64)
+	ObserveRoundtrip(seconds float64)
 	IncError(kind string)
 	IncQueueReject()
 }
@@ -100,6 +101,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if d.metrics != nil {
 			d.metrics.IncError("body")
+			d.metrics.ObserveDuration(time.Since(start).Seconds())
 		}
 		http.Error(w, `{"error":"request_entity_too_large","message":"Request body exceeds configured limit."}`, http.StatusRequestEntityTooLarge)
 		d.accessLog("method", r.Method, "path", r.URL.Path, "status", http.StatusRequestEntityTooLarge,
@@ -117,6 +119,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.metrics != nil {
 				d.metrics.IncQueueReject()
 				d.metrics.IncError("capacity")
+				d.metrics.ObserveDuration(time.Since(start).Seconds())
 			}
 			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"error":   "server_capacity_exceeded",
@@ -139,6 +142,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if d.metrics != nil {
 				d.metrics.IncError("acquire")
+				d.metrics.ObserveDuration(time.Since(start).Seconds())
 			}
 			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"error":   "server_capacity_exceeded",
@@ -173,7 +177,11 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqCtx, reqCancel := context.WithTimeout(r.Context(), d.cfg.Workers.RequestTimeout)
 	defer reqCancel()
 
+	roundStart := time.Now()
 	resp, err := d.pool.Client().Send(reqCtx, wrk, env)
+	if d.metrics != nil {
+		d.metrics.ObserveRoundtrip(time.Since(roundStart).Seconds())
+	}
 	if err != nil {
 		d.pool.Discard(wrk, err)
 		timedOut := errors.Is(err, context.DeadlineExceeded) || isTimeoutErr(err)

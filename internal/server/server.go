@@ -167,6 +167,14 @@ func (s *Server) Run(ctx context.Context) error {
 		names = append(names, p.Name())
 	}
 	s.logger.Info("starting eregion", "version", s.version, "addr", s.cfg.Addr(), "workloads", names)
+	if s.httpPool != nil {
+		s.logger.Info("http pool config",
+			"workers", s.cfg.Workers.Count,
+			"queue_capacity", s.cfg.Queue.Capacity,
+			"max_requests", s.cfg.Workers.MaxRequests,
+			"acquire_timeout", s.cfg.Workers.AcquireTimeout,
+		)
+	}
 	sizing.LogRuntimeResources(s.logger, s.runtimeRes, s.workerSizing)
 	sizing.LogMemoryEnvelope(s.logger, s.runtimeRes, s.cfg.Workers.Count, s.cfg.Workers.MemoryLimitMB)
 

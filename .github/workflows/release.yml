@@ -154,6 +154,10 @@ jobs:
 
           Do not rewrite assets on this tag after publication.
           EOF
+          if [ -f "docs/releases/${VERSION}.md" ]; then
+            printf '\n' >> /tmp/release-notes.md
+            cat "docs/releases/${VERSION}.md" >> /tmp/release-notes.md
+          fi
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
