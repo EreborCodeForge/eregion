@@ -37,11 +37,14 @@ type Registry struct {
 	queueRejects    atomic.Uint64
 	durationCount   atomic.Uint64
 	durationSum     atomic.Uint64 // nanoseconds
+	durationHist    *histogram
 	queueWaitCount  atomic.Uint64
 	queueWaitSum    atomic.Uint64 // nanoseconds
+	queueWaitHist   *histogram
 	roundtripCount  atomic.Uint64
 	roundtripSum    atomic.Uint64 // nanoseconds
-	replaceDuration sync.Map      // reason -> *nsAccum
+	roundtripHist   *histogram
+	replaceDuration sync.Map // reason -> *nsAccum
 	recycleTotal    sync.Map
 	restartTotal    atomic.Uint64
 	restartByWL     sync.Map // workload -> *atomic.Uint64
@@ -49,6 +52,13 @@ type Registry struct {
 	guardRecycle    sync.Map // "workload|reason" -> *atomic.Uint64
 	guardSuppressed sync.Map // workload -> *atomic.Uint64
 	guardHalfOpen   sync.Map // "workload|result" -> *atomic.Uint64
+	exitEvents      sync.Map // "workload|reason" -> *atomic.Uint64
+	backlog         BacklogStats
+}
+
+// BacklogStats is the last backlog sample for one workload. measured is false when the value is unknown.
+type BacklogStats interface {
+	Stats(workloadName string) (messages int, measured bool, ageSeconds float64, configured bool)
 }
 
 // NewRegistry creates metrics backed by the pool manager and cached resource sizing.
@@ -70,7 +80,18 @@ func NewRegistry(cfg config.Config, pools *worker.Manager, res resources.Runtime
 		workersRecommended:    float64(sz.RecommendedWorkers),
 		workersRecommendedMin: float64(sz.RecommendedMin),
 		workersRecommendedMax: float64(sz.RecommendedMax),
+		durationHist:          newHistogram(),
+		queueWaitHist:         newHistogram(),
+		roundtripHist:         newHistogram(),
 	}
+}
+
+// SetBacklogStats attaches the opt-in backlog sampler. Nil keeps the series absent.
+func (r *Registry) SetBacklogStats(stats BacklogStats) {
+	if r == nil {
+		return
+	}
+	r.backlog = stats
 }
 
 func (r *Registry) IncRequests()    { r.requestsTotal.Add(1) }
@@ -79,12 +100,15 @@ func (r *Registry) DecInFlight()    { r.inFlight.Add(-1) }
 func (r *Registry) IncQueueReject() { r.queueRejects.Add(1) }
 func (r *Registry) ObserveDuration(sec float64) {
 	observeNanos(&r.durationCount, &r.durationSum, sec)
+	r.durationHist.observe(sec)
 }
 func (r *Registry) ObserveQueueWait(sec float64) {
 	observeNanos(&r.queueWaitCount, &r.queueWaitSum, sec)
+	r.queueWaitHist.observe(sec)
 }
 func (r *Registry) ObserveRoundtrip(sec float64) {
 	observeNanos(&r.roundtripCount, &r.roundtripSum, sec)
+	r.roundtripHist.observe(sec)
 }
 
 // ObserveReplace records one completed planned replacement.
@@ -139,6 +163,20 @@ func (r *Registry) IncRecycle(reason string) {
 	v, _ := r.recycleTotal.LoadOrStore(reason, &atomic.Uint64{})
 	v.(*atomic.Uint64).Add(1)
 }
+func (r *Registry) IncExit(workload, reason string) {
+	if workload == "" {
+		workload = "http"
+	}
+	switch reason {
+	case "planned", "crash", "timeout", "protocol", "other":
+	default:
+		reason = "other"
+	}
+	key := workload + "|" + reason
+	v, _ := r.exitEvents.LoadOrStore(key, &atomic.Uint64{})
+	v.(*atomic.Uint64).Add(1)
+}
+
 func (r *Registry) IncRestart() {
 	r.restartTotal.Add(1)
 	name := "http"
@@ -200,6 +238,13 @@ func (m workloadMetrics) IncRecycle(reason string) { m.reg.IncRecycle(reason) }
 func (m workloadMetrics) ObserveReplace(reason string, sec float64) {
 	m.reg.ObserveReplace(reason, sec)
 }
+func (m workloadMetrics) IncExit(workload, reason string) {
+	if workload == "" {
+		workload = m.name
+	}
+	m.reg.IncExit(workload, reason)
+}
+
 func (m workloadMetrics) IncRestart() {
 	m.reg.restartTotal.Add(1)
 	m.reg.incRestartWL(m.name)
@@ -226,13 +271,13 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeCounter("eregion_http_requests_total", r.requestsTotal.Load())
 		writeGauge("eregion_http_requests_in_flight", float64(r.inFlight.Load()))
 		writeCounter("eregion_http_queue_rejects_total", r.queueRejects.Load())
-		fmt.Fprintf(&b, "# TYPE eregion_http_request_duration_seconds summary\n")
+		r.durationHist.write(&b, "eregion_http_request_duration_seconds")
 		fmt.Fprintf(&b, "eregion_http_request_duration_seconds_count %d\n", r.durationCount.Load())
 		fmt.Fprintf(&b, "eregion_http_request_duration_seconds_sum %g\n", nanosToSeconds(r.durationSum.Load()))
-		fmt.Fprintf(&b, "# TYPE eregion_queue_wait_duration_seconds summary\n")
+		r.queueWaitHist.write(&b, "eregion_queue_wait_duration_seconds")
 		fmt.Fprintf(&b, "eregion_queue_wait_duration_seconds_count %d\n", r.queueWaitCount.Load())
 		fmt.Fprintf(&b, "eregion_queue_wait_duration_seconds_sum %g\n", nanosToSeconds(r.queueWaitSum.Load()))
-		fmt.Fprintf(&b, "# TYPE eregion_worker_roundtrip_duration_seconds summary\n")
+		r.roundtripHist.write(&b, "eregion_worker_roundtrip_duration_seconds")
 		fmt.Fprintf(&b, "eregion_worker_roundtrip_duration_seconds_count %d\n", r.roundtripCount.Load())
 		fmt.Fprintf(&b, "eregion_worker_roundtrip_duration_seconds_sum %g\n", nanosToSeconds(r.roundtripSum.Load()))
 
@@ -267,6 +312,15 @@ func (r *Registry) Handler() http.HandlerFunc {
 		writeGauge("eregion_workers_recommended_min", r.workersRecommendedMin)
 		writeGauge("eregion_workers_recommended_max", r.workersRecommendedMax)
 		writeCounter("eregion_worker_restarts_total", r.restartTotal.Load())
+		fmt.Fprintf(&b, "# TYPE eregion_workload_worker_exit_events_total counter\n")
+		r.exitEvents.Range(func(k, v any) bool {
+			parts := strings.SplitN(k.(string), "|", 2)
+			if len(parts) != 2 {
+				return true
+			}
+			fmt.Fprintf(&b, "eregion_workload_worker_exit_events_total{workload=%q,reason=%q} %d\n", parts[0], parts[1], v.(*atomic.Uint64).Load())
+			return true
+		})
 		r.recycleTotal.Range(func(k, v any) bool {
 			fmt.Fprintf(&b, "eregion_worker_recycles_total{reason=%q} %d\n", k, v.(*atomic.Uint64).Load())
 			return true
@@ -286,6 +340,11 @@ func (r *Registry) Handler() http.HandlerFunc {
 		fmt.Fprintf(&b, "# TYPE eregion_workload_busy_workers gauge\n")
 		fmt.Fprintf(&b, "# TYPE eregion_workload_draining_workers gauge\n")
 		fmt.Fprintf(&b, "# TYPE eregion_workload_failed_workers gauge\n")
+		if r.backlog != nil {
+			fmt.Fprintf(&b, "# TYPE eregion_workload_backlog_messages gauge\n")
+			fmt.Fprintf(&b, "# TYPE eregion_workload_backlog_collection_success gauge\n")
+			fmt.Fprintf(&b, "# TYPE eregion_workload_backlog_last_success_age_seconds gauge\n")
+		}
 		for _, p := range r.pools.List() {
 			snap := p.Snapshot()
 			name := p.Name()
@@ -294,6 +353,23 @@ func (r *Registry) Handler() http.HandlerFunc {
 			fmt.Fprintf(&b, "eregion_workload_busy_workers{workload=%q} %d\n", name, snap.Busy)
 			fmt.Fprintf(&b, "eregion_workload_draining_workers{workload=%q} %d\n", name, snap.Draining)
 			fmt.Fprintf(&b, "eregion_workload_failed_workers{workload=%q} %d\n", name, snap.Failed)
+			if r.backlog != nil {
+				messages, measured, age, configured := r.backlog.Stats(name)
+				if !configured {
+					continue
+				}
+				success := 0
+				if measured {
+					success = 1
+				}
+				fmt.Fprintf(&b, "eregion_workload_backlog_collection_success{workload=%q} %d\n", name, success)
+				if measured {
+					fmt.Fprintf(&b, "eregion_workload_backlog_messages{workload=%q} %d\n", name, messages)
+				}
+				if age > 0 || measured {
+					fmt.Fprintf(&b, "eregion_workload_backlog_last_success_age_seconds{workload=%q} %g\n", name, age)
+				}
+			}
 		}
 		fmt.Fprintf(&b, "# TYPE eregion_workload_restarts_total counter\n")
 		r.restartByWL.Range(func(k, v any) bool {

@@ -112,6 +112,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("operations.prefix must start with /")
 	}
 
+	switch c.Metrics.Access {
+	case "", "loopback", "public":
+	default:
+		return fmt.Errorf("metrics.access must be loopback or public")
+	}
 	if err := c.ResolveEndpoints(); err != nil {
 		return err
 	}

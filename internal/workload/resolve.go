@@ -109,6 +109,22 @@ func Resolve(spec WorkloadSpec, templates map[string]WorkloadTemplate) (Resolved
 	default:
 		return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: unknown scaling strategy %q", spec.Name, out.Scaling.Strategy)
 	}
+	if out.Scaling.Strategy == StrategyBacklog {
+		src := out.Scaling.BacklogSource
+		if src.Type != "http_json" || src.URLEnv == "" {
+			return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: strategy backlog requires backlog_source.type=http_json and url_env", spec.Name)
+		}
+		if src.Timeout <= 0 {
+			src.Timeout = 250 * time.Millisecond
+		}
+		if src.Timeout > time.Second {
+			return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: backlog_source.timeout must be <= 1s", spec.Name)
+		}
+		if src.MaxStaleness <= 0 {
+			src.MaxStaleness = 5 * time.Second
+		}
+		out.Scaling.BacklogSource = src
+	}
 
 	return out, nil
 }
@@ -129,6 +145,9 @@ func mergeScaling(base, over ScalingPolicy) ScalingPolicy {
 	}
 	if over.TargetDrainTime > 0 {
 		out.TargetDrainTime = over.TargetDrainTime
+	}
+	if over.BacklogSource.Type != "" {
+		out.BacklogSource = over.BacklogSource
 	}
 	return out
 }

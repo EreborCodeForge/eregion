@@ -42,8 +42,17 @@ type WorkerPolicy struct {
 
 // ResourcePolicy is resource class and memory envelope.
 type ResourcePolicy struct {
-	Class     ResourceClass
-	MemoryMB  int
+	Class    ResourceClass
+	MemoryMB int
+}
+
+// BacklogSource is a resolved http_json adapter. It stores env var names, never token values or URLs.
+type BacklogSource struct {
+	Type         string
+	URLEnv       string
+	TokenEnv     string
+	Timeout      time.Duration
+	MaxStaleness time.Duration
 }
 
 // ScalingPolicy controls autoscaling behaviour.
@@ -54,6 +63,7 @@ type ScalingPolicy struct {
 	// Backlog formula knobs (used when strategy=backlog and a provider exists).
 	AvgJobDuration  time.Duration
 	TargetDrainTime time.Duration
+	BacklogSource   BacklogSource
 }
 
 // WorkloadTemplate is operational behaviour shared by workloads.

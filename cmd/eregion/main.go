@@ -168,11 +168,19 @@ func cmdCheck(args []string) int {
 	fmt.Printf("  host=%s port=%d workers=%d queue=%d\n",
 		cfg.Server.Host, cfg.Server.Port, cfg.Workers.Count, cfg.Queue.Capacity)
 	fmt.Printf("  php=%s script=%s\n", cfg.PHP.Binary, cfg.PHP.WorkerScript)
-	if resolved, err := cfg.ResolveWorkloads(); err == nil {
-		fmt.Printf("  workloads=%d\n", len(resolved))
-		for _, w := range resolved {
-			fmt.Printf("    - %s mode=%s workers=%d..%d\n", w.Name, w.Mode, w.Workers.Min, w.Workers.Max)
-		}
+	access := cfg.Metrics.Access
+	if access == "" {
+		access = "unset"
+	}
+	fmt.Printf("  metrics_access=%s\n", access)
+	resolved, err := cfg.ResolveWorkloads()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  workloads=%d\n", len(resolved))
+	for _, w := range resolved {
+		fmt.Printf("    - %s mode=%s workers=%d..%d\n", w.Name, w.Mode, w.Workers.Min, w.Workers.Max)
 	}
 	return 0
 }

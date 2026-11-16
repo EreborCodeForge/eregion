@@ -37,6 +37,7 @@ type Server struct {
 	http         *http.Server
 	shuttingDown atomic.Bool
 	reconciler   *reconciler.Reconciler
+	backlog      *scaling.HTTPJSONBacklogProvider
 }
 
 // New constructs a server from config.
@@ -99,7 +100,11 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		}
 	}
 
-	strategies := scaling.NewRegistry(nil)
+	backlog := scaling.NewHTTPJSONBacklogProvider(resolved)
+	strategies := scaling.NewRegistry(backlog)
+	if backlog != nil {
+		metrics.SetBacklogStats(backlog)
+	}
 	rec := reconciler.New(registry, pools, strategies, runtimeRes, logger)
 
 	mux := http.NewServeMux()
@@ -114,6 +119,7 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		runtimeRes:   runtimeRes,
 		workerSizing: workerSizing,
 		reconciler:   rec,
+		backlog:      backlog,
 	}
 
 	if cfg.Liveness.Enabled {
@@ -134,8 +140,11 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 			mux.HandleFunc(cfg.Health.Path, telemetry.HealthHandlerMulti(pools))
 		}
 	}
+	if cfg.Metrics.Enabled && cfg.Metrics.Access == "" {
+		logger.Warn("metrics.access is unset; the metrics endpoint keeps the previous reachable behavior. Set metrics.access to loopback or public")
+	}
 	if cfg.Metrics.Enabled {
-		mux.HandleFunc(cfg.Metrics.Path, metrics.Handler())
+		mux.HandleFunc(cfg.Metrics.Path, guardMetrics(metrics.Handler(), cfg.Metrics.Access))
 	}
 
 	if hasHTTP {
@@ -166,6 +175,7 @@ func (s *Server) Run(ctx context.Context) error {
 	for _, p := range s.pools.List() {
 		names = append(names, p.Name())
 	}
+	startPprof(s.logger)
 	s.logger.Info("starting eregion", "version", s.version, "addr", s.cfg.Addr(), "workloads", names)
 	if s.httpPool != nil {
 		s.logger.Info("http pool config",
@@ -214,6 +224,24 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+func guardMetrics(next http.HandlerFunc, access string) http.HandlerFunc {
+	if access != "loopback" {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (s *Server) shutdown() error {
 	s.logger.Info("graceful shutdown started")
 	s.shuttingDown.Store(true)
@@ -221,6 +249,9 @@ func (s *Server) shutdown() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.Server.ShutdownTimeout)
 	defer cancel()
 
+	if s.backlog != nil {
+		s.backlog.Close()
+	}
 	httpErr := s.http.Shutdown(shutdownCtx)
 	poolCtx, poolCancel := context.WithTimeout(context.Background(), s.cfg.Workers.ShutdownTimeout+time.Second)
 	defer poolCancel()

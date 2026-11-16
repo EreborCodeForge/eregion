@@ -65,6 +65,9 @@ func TestSubMillisecondDurationsArePreserved(t *testing.T) {
 	if got := metricValue(t, body, "eregion_http_request_duration_seconds_count"); got != 3 {
 		t.Fatalf("duration count=%v", got)
 	}
+	if !strings.Contains(body, "eregion_http_request_duration_seconds_bucket{le=\"0.0005\"} 3") {
+		t.Fatalf("0.0004s samples missing from the 0.0005 bucket\n%s", body)
+	}
 	sum := metricValue(t, body, "eregion_http_request_duration_seconds_sum")
 	if math.Abs(sum-0.0012) > 1e-6 {
 		t.Fatalf("duration sum=%v, want ~0.0012 (sub-millisecond samples must not become 0)", sum)

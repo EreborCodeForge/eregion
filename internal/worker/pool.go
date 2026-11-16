@@ -43,6 +43,11 @@ type PoolMetrics interface {
 	ObserveReplace(reason string, seconds float64)
 }
 
+// ExitRecorder counts a worker process exit under a closed reason enum.
+type ExitRecorder interface {
+	IncExit(workload, reason string)
+}
+
 // ScaleEventRecorder records scale up/down events (optional).
 type ScaleEventRecorder interface {
 	IncScale(workload, direction string)
@@ -441,6 +446,18 @@ func (p *Pool) GuardBreakerState() string {
 	return p.breaker.State()
 }
 
+func (p *Pool) recordExit(reason string) {
+	rec, ok := p.metrics.(ExitRecorder)
+	if !ok {
+		return
+	}
+	name := p.name
+	if name == "" {
+		name = "http"
+	}
+	rec.IncExit(name, reason)
+}
+
 func (p *Pool) monitor(s *slot, w *Worker) {
 	defer p.wg.Done()
 	defer close(s.monitorDone)
@@ -482,14 +499,17 @@ func (p *Pool) monitor(s *slot, w *Worker) {
 	p.purgeIdle(w)
 
 	if stopping || retired {
+		p.recordExit("planned")
 		p.notify()
 		return
 	}
 
 	if planned {
+		p.recordExit("planned")
 		p.logger.Info("planned recycle complete", "worker_id", w.ID, "generation", w.Generation)
 		p.scheduleRestart(s, false)
 	} else {
+		p.recordExit(ClassifyExit(false, exitCode, s.exitReason))
 		p.mu.Lock()
 		p.recordCrashLocked(s)
 		failed := p.exceededRestartPolicyLocked(s)
@@ -976,6 +996,11 @@ func (p *Pool) Discard(w *Worker, reason error) {
 		return
 	}
 	s.plannedExit = false
+	raw := ""
+	if reason != nil {
+		raw = reason.Error()
+	}
+	s.exitReason = ClassifyExit(false, 1, raw)
 	w.setState(StateDraining)
 	conn := w.conn
 	cmd := w.cmd

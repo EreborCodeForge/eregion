@@ -75,11 +75,21 @@ type WorkloadResourcesConfig struct {
 
 // WorkloadScalingConfig is scaling policy knobs.
 type WorkloadScalingConfig struct {
-	Strategy         *string `yaml:"strategy"`
-	ScaleUpCooldown  *string `yaml:"scale_up_cooldown"`
-	ScaleDownIdleFor *string `yaml:"scale_down_idle_for"`
-	AvgJobDuration   *string `yaml:"avg_job_duration"`
-	TargetDrainTime  *string `yaml:"target_drain_time"`
+	Strategy         *string              `yaml:"strategy"`
+	ScaleUpCooldown  *string              `yaml:"scale_up_cooldown"`
+	ScaleDownIdleFor *string              `yaml:"scale_down_idle_for"`
+	AvgJobDuration   *string              `yaml:"avg_job_duration"`
+	TargetDrainTime  *string              `yaml:"target_drain_time"`
+	BacklogSource    *BacklogSourceConfig `yaml:"backlog_source"`
+}
+
+// BacklogSourceConfig names an HTTP JSON backlog adapter. Env fields are variable names, not secrets.
+type BacklogSourceConfig struct {
+	Type         *string `yaml:"type"`
+	URLEnv       *string `yaml:"url_env"`
+	TokenEnv     *string `yaml:"token_env"`
+	Timeout      *string `yaml:"timeout"`
+	MaxStaleness *string `yaml:"max_staleness"`
 }
 
 // WorkloadQueueConfig is broker metadata (not consumed by Eregion).
@@ -161,6 +171,8 @@ type OperationsConfig struct {
 type EndpointConfig struct {
 	Enabled bool
 	Path    string
+	// Access is metrics-only: "" keeps the previous open behavior, loopback or public are explicit.
+	Access string
 }
 
 // GuardRecycleSafetyConfig is the per-process policy for guard_state_violation storms.

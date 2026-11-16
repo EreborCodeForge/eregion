@@ -107,6 +107,7 @@ type fileOperations struct {
 type fileEndpoint struct {
 	Enabled *bool   `yaml:"enabled"`
 	Path    *string `yaml:"path"`
+	Access  *string `yaml:"access"`
 }
 
 type fileGuardRecycle struct {
@@ -319,6 +320,9 @@ func applyFile(cfg *Config, file *fileConfig) error {
 		cfg.Operations.Prefix = *file.Operations.Prefix
 	}
 	applyEndpoint(&cfg.Metrics, &file.Metrics)
+	if file.Metrics.Access != nil {
+		cfg.Metrics.Access = strings.TrimSpace(*file.Metrics.Access)
+	}
 	applyEndpoint(&cfg.Health, &file.Health)
 	applyEndpoint(&cfg.Readiness, &file.Readiness)
 	applyEndpoint(&cfg.Liveness, &file.Liveness)

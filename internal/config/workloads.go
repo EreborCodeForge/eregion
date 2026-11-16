@@ -149,5 +149,30 @@ func convertScaling(s WorkloadScalingConfig) (workload.ScalingPolicy, error) {
 			return out, fmt.Errorf("invalid target_drain_time: %w", err)
 		}
 	}
+	if s.BacklogSource != nil {
+		src := workload.BacklogSource{}
+		if s.BacklogSource.Type != nil {
+			src.Type = *s.BacklogSource.Type
+		}
+		if s.BacklogSource.URLEnv != nil {
+			src.URLEnv = *s.BacklogSource.URLEnv
+		}
+		if s.BacklogSource.TokenEnv != nil {
+			src.TokenEnv = *s.BacklogSource.TokenEnv
+		}
+		if s.BacklogSource.Timeout != nil {
+			src.Timeout, err = time.ParseDuration(*s.BacklogSource.Timeout)
+			if err != nil {
+				return out, fmt.Errorf("invalid backlog_source.timeout: %w", err)
+			}
+		}
+		if s.BacklogSource.MaxStaleness != nil {
+			src.MaxStaleness, err = time.ParseDuration(*s.BacklogSource.MaxStaleness)
+			if err != nil {
+				return out, fmt.Errorf("invalid backlog_source.max_staleness: %w", err)
+			}
+		}
+		out.BacklogSource = src
+	}
 	return out, nil
 }

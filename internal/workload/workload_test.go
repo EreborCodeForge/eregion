@@ -42,6 +42,10 @@ func TestTemplateOverrides(t *testing.T) {
 				Strategy:         workload.StrategyBacklog,
 				ScaleUpCooldown:  time.Second,
 				ScaleDownIdleFor: 30 * time.Second,
+				BacklogSource: workload.BacklogSource{
+					Type:   "http_json",
+					URLEnv: "EREGION_TELEMETRY_BACKLOG_URL",
+				},
 			},
 		},
 	}
