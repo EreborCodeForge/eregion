@@ -126,6 +126,55 @@ func startServer(t *testing.T, cfg config.Config) string {
 	return ""
 }
 
+func TestHelloBurstCountsGatewayErrors(t *testing.T) {
+	cfg := testConfig(t, filepath.Join(fixturesDir(t), "healthy-worker.php"))
+	cfg.Workers.Count = 2
+	cfg.Queue.Capacity = 64
+	base := startServer(t, cfg)
+	const total = 200
+	const workers = 8
+	codes := make([]int, total)
+	var wg sync.WaitGroup
+	jobs := make(chan int, total)
+	for i := 0; i < total; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{Timeout: 5 * time.Second}
+			for i := range jobs {
+				resp, err := client.Get(base + "/hello")
+				if err != nil {
+					codes[i] = -1
+					continue
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				codes[i] = resp.StatusCode
+			}
+		}()
+	}
+	wg.Wait()
+	var ok, gateway, failed int
+	for _, code := range codes {
+		switch {
+		case code == 200:
+			ok++
+		case code == 502 || code == 503 || code == 504:
+			gateway++
+		default:
+			failed++
+		}
+	}
+	t.Logf("hello burst ok=%d gateway_502_503_504=%d other=%d", ok, gateway, failed)
+	if ok == 0 || failed > 0 {
+		t.Fatalf("burst did not stay on counted HTTP statuses: ok=%d gateway=%d other=%d", ok, gateway, failed)
+	}
+}
+
 func TestHealthyGET(t *testing.T) {
 	cfg := testConfig(t, filepath.Join(fixturesDir(t), "healthy-worker.php"))
 	base := startServer(t, cfg)
