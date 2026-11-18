@@ -12,10 +12,10 @@ import (
 type Hysteresis struct {
 	Inner Strategy
 
-	mu            sync.Mutex
-	lastScaleUp   time.Time
+	mu             sync.Mutex
+	lastScaleUp    time.Time
 	scaleDownSince map[string]time.Time // workload → when desired first dropped
-	lastDesired   map[string]int
+	lastDesired    map[string]int
 }
 
 // NewHysteresis wraps inner with per-workload hysteresis state.
@@ -27,13 +27,31 @@ func NewHysteresis(inner Strategy) *Hysteresis {
 	}
 }
 
+// Decide evaluates the inner strategy once and applies hysteresis to the legacy target.
+func (h *Hysteresis) Decide(
+	spec workload.ResolvedWorkloadSpec,
+	metrics workload.WorkloadMetrics,
+	runtime resources.RuntimeResources,
+) (StrategyEvaluation, int) {
+	ev := evaluateInner(h.Inner, spec, metrics, runtime)
+	return ev, h.stabilize(spec, metrics, ev.LegacyTarget)
+}
+
 // DesiredWorkers applies hysteresis around the inner strategy.
 func (h *Hysteresis) DesiredWorkers(
 	spec workload.ResolvedWorkloadSpec,
 	metrics workload.WorkloadMetrics,
 	runtime resources.RuntimeResources,
 ) int {
-	raw := h.Inner.DesiredWorkers(spec, metrics, runtime)
+	_, policy := h.Decide(spec, metrics, runtime)
+	return policy
+}
+
+func (h *Hysteresis) stabilize(
+	spec workload.ResolvedWorkloadSpec,
+	metrics workload.WorkloadMetrics,
+	raw int,
+) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 

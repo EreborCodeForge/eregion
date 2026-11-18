@@ -21,6 +21,23 @@ type BacklogProvider interface {
 	Backlog(workloadName string) (int, bool)
 }
 
+// StrategyEvaluation separates raw demand from the historical clamp.
+// LegacyTarget matches the pre-ECO-09 DesiredWorkers result, including min reapplied after a hard cap.
+type StrategyEvaluation struct {
+	RawDemand    int
+	LegacyTarget int
+}
+
+// StrategyEvaluator computes raw demand and the legacy target in one pass.
+// Backlog providers are consulted at most once.
+type StrategyEvaluator interface {
+	Evaluate(
+		spec workload.ResolvedWorkloadSpec,
+		metrics workload.WorkloadMetrics,
+		runtime resources.RuntimeResources,
+	) StrategyEvaluation
+}
+
 // Registry selects a strategy by name.
 type Registry struct {
 	Fixed     Strategy
@@ -49,8 +66,47 @@ func (r *Registry) For(name workload.ScalingStrategyName) Strategy {
 	}
 }
 
-// ClampDesired clamps n into [min,max] then applies resource headroom.
+// ClampDesired clamps n into [min,max] and then applies a memory hard cap.
+// workers.min is not reapplied after that hard cap. A CPU ceiling is soft:
+// without a memory hard cap it does not pull the result below min.
 func ClampDesired(n, min, max int, spec workload.ResolvedWorkloadSpec, runtime resources.RuntimeResources) int {
+	if min < 0 {
+		min = 0
+	}
+	if n < min {
+		n = min
+	}
+	if max > 0 && n > max {
+		n = max
+	}
+	if n < 0 {
+		n = 0
+	}
+	capped, hard := memoryHardCap(n, spec, runtime)
+	if hard {
+		n = capped
+		if cpu, ok := cpuSoftCap(spec, runtime); ok && cpu < n {
+			n = cpu
+		}
+	} else if cpu, ok := cpuSoftCap(spec, runtime); ok && cpu < n {
+		if cpu < min {
+			n = min
+		} else {
+			n = cpu
+		}
+	}
+	if max > 0 && n > max {
+		n = max
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n
+}
+
+// clampLegacy preserves the historical ClampDesired result used by DesiredWorkers.
+// off and observe keep this target so existing projects do not change size.
+func clampLegacy(n, min, max int, spec workload.ResolvedWorkloadSpec, runtime resources.RuntimeResources) int {
 	if n < min {
 		n = min
 	}
@@ -71,47 +127,82 @@ func applyResourceClamp(n int, spec workload.ResolvedWorkloadSpec, runtime resou
 	if n <= 0 {
 		return n
 	}
-	// Memory: if workload declares memory_mb and host limit known, clamp by envelope.
-	if spec.Resources.MemoryMB > 0 && runtime.MemoryLimitKnown && runtime.MemoryLimitBytes > 0 {
-		per := uint64(spec.Resources.MemoryMB) * 1024 * 1024
-		if per > 0 {
-			maxByMem := int(runtime.MemoryLimitBytes / per)
-			if maxByMem < n {
-				n = maxByMem
-			}
-		}
+	if capped, hard := memoryHardCap(n, spec, runtime); hard {
+		n = capped
 	}
-	// CPU contributes a soft ceiling but never alone decides (combined with memory clamp above).
-	if runtime.AvailableCPUs > 0 {
-		var perCPU float64
-		switch spec.Resources.Class {
-		case workload.ClassCPU:
-			perCPU = 1.0
-		case workload.ClassIO:
-			perCPU = 4.0
-		default:
-			perCPU = 2.0
-		}
-		maxByCPU := int(math.Ceil(runtime.AvailableCPUs * perCPU))
-		if maxByCPU < 1 {
-			maxByCPU = 1
-		}
-		if maxByCPU < n {
-			n = maxByCPU
-		}
+	if cpu, ok := cpuSoftCap(spec, runtime); ok && cpu < n {
+		n = cpu
 	}
 	return n
+}
+
+func memoryHardCap(n int, spec workload.ResolvedWorkloadSpec, runtime resources.RuntimeResources) (int, bool) {
+	if n <= 0 || spec.Resources.MemoryMB <= 0 || !runtime.MemoryLimitKnown || runtime.MemoryLimitBytes == 0 {
+		return n, false
+	}
+	per := uint64(spec.Resources.MemoryMB) * 1024 * 1024
+	if per == 0 {
+		return n, false
+	}
+	maxByMem := int(runtime.MemoryLimitBytes / per)
+	if maxByMem < n {
+		return maxByMem, true
+	}
+	return n, false
+}
+
+func cpuSoftCap(spec workload.ResolvedWorkloadSpec, runtime resources.RuntimeResources) (int, bool) {
+	if runtime.AvailableCPUs <= 0 {
+		return 0, false
+	}
+	perCPU := workersPerCPU(spec.Resources.Class)
+	maxByCPU := int(math.Ceil(runtime.AvailableCPUs * perCPU))
+	if maxByCPU < 1 {
+		maxByCPU = 1
+	}
+	return maxByCPU, true
+}
+
+func workersPerCPU(class workload.ResourceClass) float64 {
+	switch class {
+	case workload.ClassCPU:
+		return 1
+	case workload.ClassIO:
+		return 4
+	default:
+		return 2
+	}
+}
+
+func evaluateInner(
+	inner Strategy,
+	spec workload.ResolvedWorkloadSpec,
+	metrics workload.WorkloadMetrics,
+	runtime resources.RuntimeResources,
+) StrategyEvaluation {
+	if ev, ok := inner.(StrategyEvaluator); ok {
+		return ev.Evaluate(spec, metrics, runtime)
+	}
+	n := inner.DesiredWorkers(spec, metrics, runtime)
+	return StrategyEvaluation{RawDemand: n, LegacyTarget: n}
 }
 
 // Fixed keeps capacity at workers.max (steady configured size).
 type Fixed struct{}
 
-func (Fixed) DesiredWorkers(spec workload.ResolvedWorkloadSpec, _ workload.WorkloadMetrics, runtime resources.RuntimeResources) int {
+func (f Fixed) DesiredWorkers(spec workload.ResolvedWorkloadSpec, metrics workload.WorkloadMetrics, runtime resources.RuntimeResources) int {
+	return f.Evaluate(spec, metrics, runtime).LegacyTarget
+}
+
+func (Fixed) Evaluate(spec workload.ResolvedWorkloadSpec, _ workload.WorkloadMetrics, runtime resources.RuntimeResources) StrategyEvaluation {
 	desired := spec.Workers.Max
 	if desired < spec.Workers.Min {
 		desired = spec.Workers.Min
 	}
-	return ClampDesired(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime)
+	return StrategyEvaluation{
+		RawDemand:    desired,
+		LegacyTarget: clampLegacy(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime),
+	}
 }
 
 // Backlog scales from broker depth when a provider is available.
@@ -120,16 +211,19 @@ type Backlog struct {
 }
 
 func (b Backlog) DesiredWorkers(spec workload.ResolvedWorkloadSpec, metrics workload.WorkloadMetrics, runtime resources.RuntimeResources) int {
+	return b.Evaluate(spec, metrics, runtime).LegacyTarget
+}
+
+func (b Backlog) Evaluate(spec workload.ResolvedWorkloadSpec, metrics workload.WorkloadMetrics, runtime resources.RuntimeResources) StrategyEvaluation {
 	backlog := metrics.Backlog
 	if b.Provider != nil {
 		if v, ok := b.Provider.Backlog(spec.Name); ok {
 			backlog = v
 		} else {
-			// No provider data → stay at min (spec: first version may use fixed).
-			return ClampDesired(spec.Workers.Min, spec.Workers.Min, spec.Workers.Max, spec, runtime)
+			return legacyMin(spec, runtime)
 		}
 	} else {
-		return ClampDesired(spec.Workers.Min, spec.Workers.Min, spec.Workers.Max, spec, runtime)
+		return legacyMin(spec, runtime)
 	}
 
 	avg := spec.Scaling.AvgJobDuration.Seconds()
@@ -141,22 +235,27 @@ func (b Backlog) DesiredWorkers(spec workload.ResolvedWorkloadSpec, metrics work
 		drain = 10
 	}
 	desired := int(math.Ceil(float64(backlog) * avg / drain))
-	return ClampDesired(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime)
+	return StrategyEvaluation{
+		RawDemand:    desired,
+		LegacyTarget: clampLegacy(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime),
+	}
+}
+
+func legacyMin(spec workload.ResolvedWorkloadSpec, runtime resources.RuntimeResources) StrategyEvaluation {
+	return StrategyEvaluation{
+		RawDemand:    spec.Workers.Min,
+		LegacyTarget: clampLegacy(spec.Workers.Min, spec.Workers.Min, spec.Workers.Max, spec, runtime),
+	}
 }
 
 // Resources sizes from CPU/memory class without backlog.
 type Resources struct{}
 
-func (Resources) DesiredWorkers(spec workload.ResolvedWorkloadSpec, _ workload.WorkloadMetrics, runtime resources.RuntimeResources) int {
-	var perCPU float64
-	switch spec.Resources.Class {
-	case workload.ClassCPU:
-		perCPU = 1.0
-	case workload.ClassIO:
-		perCPU = 4.0
-	default:
-		perCPU = 2.0
-	}
+func (r Resources) DesiredWorkers(spec workload.ResolvedWorkloadSpec, metrics workload.WorkloadMetrics, runtime resources.RuntimeResources) int {
+	return r.Evaluate(spec, metrics, runtime).LegacyTarget
+}
+
+func (Resources) Evaluate(spec workload.ResolvedWorkloadSpec, _ workload.WorkloadMetrics, runtime resources.RuntimeResources) StrategyEvaluation {
 	cpus := runtime.AvailableCPUs
 	if cpus <= 0 {
 		cpus = float64(runtime.LogicalCPUs)
@@ -164,6 +263,9 @@ func (Resources) DesiredWorkers(spec workload.ResolvedWorkloadSpec, _ workload.W
 	if cpus <= 0 {
 		cpus = 1
 	}
-	desired := int(math.Ceil(cpus * perCPU))
-	return ClampDesired(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime)
+	desired := int(math.Ceil(cpus * workersPerCPU(spec.Resources.Class)))
+	return StrategyEvaluation{
+		RawDemand:    desired,
+		LegacyTarget: clampLegacy(desired, spec.Workers.Min, spec.Workers.Max, spec, runtime),
+	}
 }

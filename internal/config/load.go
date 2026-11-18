@@ -28,6 +28,7 @@ type fileConfig struct {
 	WorkloadTemplates  map[string]WorkloadTemplateConfig `yaml:"workload_templates"`
 	Workloads          map[string]WorkloadConfig         `yaml:"workloads"`
 	WorkerGuardRecycle *fileGuardRecycle                 `yaml:"worker_guard_recycle_safety"`
+	ResourceGuard      *fileResourceGuard                `yaml:"resource_guard"`
 }
 
 type fileServer struct {
@@ -119,6 +120,41 @@ type fileGuardRecycle struct {
 	HalfOpenMaxProbes          *int     `yaml:"half_open_max_probes"`
 	RecoverySuccessfulRequests *int     `yaml:"recovery_successful_requests"`
 	RecoveryMinUptime          *string  `yaml:"recovery_min_uptime"`
+}
+
+type fileResourceGuard struct {
+	Mode           *string              `yaml:"mode"`
+	SampleInterval *string              `yaml:"sample_interval"`
+	MaxSampleAge   *string              `yaml:"max_sample_age"`
+	Memory         *fileMemoryGuard     `yaml:"memory"`
+	CPU            *fileCPUGuard        `yaml:"cpu"`
+	Prediction     *filePredictionGuard `yaml:"prediction"`
+	Warnings       *fileWarningGuard    `yaml:"warnings"`
+}
+
+type fileMemoryGuard struct {
+	ReserveMB        *int     `yaml:"reserve_mb"`
+	HardLimitMB      *int     `yaml:"hard_limit_mb"`
+	ReservePercent   *int     `yaml:"reserve_percent"`
+	WorkerFallbackMB *int     `yaml:"worker_fallback_mb"`
+	WarningRatio     *float64 `yaml:"warning_ratio"`
+	CriticalRatio    *float64 `yaml:"critical_ratio"`
+	HardRatio        *float64 `yaml:"hard_ratio"`
+}
+
+type fileCPUGuard struct {
+	WarningUtilizationRatio *float64 `yaml:"warning_utilization_ratio"`
+	CriticalThrottlingRatio *float64 `yaml:"critical_throttling_ratio"`
+}
+
+type filePredictionGuard struct {
+	Enabled    *bool   `yaml:"enabled"`
+	Horizon    *string `yaml:"horizon"`
+	MinSamples *int    `yaml:"min_samples"`
+}
+
+type fileWarningGuard struct {
+	DedupeWindow *string `yaml:"dedupe_window"`
 }
 
 // Load reads and validates a YAML configuration file, merging with defaults.
@@ -337,6 +373,9 @@ func applyFile(cfg *Config, file *fileConfig) error {
 	if err := applyGuardRecycle(cfg, file.WorkerGuardRecycle); err != nil {
 		return err
 	}
+	if err := applyResourceGuard(cfg, file.ResourceGuard); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -370,6 +409,69 @@ func applyGuardRecycle(cfg *Config, file *fileGuardRecycle) error {
 	}
 	if err := applyDuration(&cfg.WorkerGuardRecycle.RecoveryMinUptime, file.RecoveryMinUptime, "worker_guard_recycle_safety.recovery_min_uptime"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func applyResourceGuard(cfg *Config, file *fileResourceGuard) error {
+	if file == nil {
+		return nil
+	}
+	if file.Mode != nil {
+		cfg.ResourceGuard.Mode = strings.TrimSpace(*file.Mode)
+	}
+	if err := applyDuration(&cfg.ResourceGuard.SampleInterval, file.SampleInterval, "resource_guard.sample_interval"); err != nil {
+		return err
+	}
+	if err := applyDuration(&cfg.ResourceGuard.MaxSampleAge, file.MaxSampleAge, "resource_guard.max_sample_age"); err != nil {
+		return err
+	}
+	if m := file.Memory; m != nil {
+		if m.ReserveMB != nil {
+			cfg.ResourceGuard.Memory.ReserveMB = *m.ReserveMB
+		}
+		if m.HardLimitMB != nil {
+			cfg.ResourceGuard.Memory.HardLimitMB = *m.HardLimitMB
+		}
+		if m.ReservePercent != nil {
+			cfg.ResourceGuard.Memory.ReservePercent = *m.ReservePercent
+		}
+		if m.WorkerFallbackMB != nil {
+			cfg.ResourceGuard.Memory.WorkerFallbackMB = *m.WorkerFallbackMB
+		}
+		if m.WarningRatio != nil {
+			cfg.ResourceGuard.Memory.WarningRatio = *m.WarningRatio
+		}
+		if m.CriticalRatio != nil {
+			cfg.ResourceGuard.Memory.CriticalRatio = *m.CriticalRatio
+		}
+		if m.HardRatio != nil {
+			cfg.ResourceGuard.Memory.HardRatio = *m.HardRatio
+		}
+	}
+	if cpu := file.CPU; cpu != nil {
+		if cpu.WarningUtilizationRatio != nil {
+			cfg.ResourceGuard.CPU.WarningUtilizationRatio = *cpu.WarningUtilizationRatio
+		}
+		if cpu.CriticalThrottlingRatio != nil {
+			cfg.ResourceGuard.CPU.CriticalThrottlingRatio = *cpu.CriticalThrottlingRatio
+		}
+	}
+	if p := file.Prediction; p != nil {
+		if p.Enabled != nil {
+			cfg.ResourceGuard.Prediction.Enabled = *p.Enabled
+		}
+		if err := applyDuration(&cfg.ResourceGuard.Prediction.Horizon, p.Horizon, "resource_guard.prediction.horizon"); err != nil {
+			return err
+		}
+		if p.MinSamples != nil {
+			cfg.ResourceGuard.Prediction.MinSamples = *p.MinSamples
+		}
+	}
+	if w := file.Warnings; w != nil {
+		if err := applyDuration(&cfg.ResourceGuard.Warnings.DedupeWindow, w.DedupeWindow, "resource_guard.warnings.dedupe_window"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

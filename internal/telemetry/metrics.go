@@ -15,6 +15,31 @@ import (
 	"github.com/EreborCodeForge/Eregion/internal/worker"
 )
 
+// GuardObservation is the last resource-guard publication. The metrics handler only reads it.
+type GuardObservation struct {
+	Mode          string
+	State         string
+	Sample        resources.Sample
+	Headroom      uint64
+	HeadroomKnown bool
+	AgeSeconds    float64
+	AgeKnown      bool
+	Horizon       string
+	Workloads     []GuardWorkload
+}
+
+// GuardWorkload is one workload row of the guard publication.
+type GuardWorkload struct {
+	Name       string
+	Requested  int
+	Policy     int
+	Admitted   int
+	WouldLimit int
+	Limited    int
+	Deficit    int
+	Reason     string
+}
+
 // Registry holds Prometheus-style counters and gauges.
 type Registry struct {
 	cfg   config.Config
@@ -54,6 +79,8 @@ type Registry struct {
 	guardHalfOpen   sync.Map // "workload|result" -> *atomic.Uint64
 	exitEvents      sync.Map // "workload|reason" -> *atomic.Uint64
 	backlog         BacklogStats
+	guardObs        atomic.Value // GuardObservation
+	admissionDenied sync.Map     // "workload|reason" -> *atomic.Uint64
 }
 
 // BacklogStats is the last backlog sample for one workload. measured is false when the value is unknown.
@@ -92,6 +119,24 @@ func (r *Registry) SetBacklogStats(stats BacklogStats) {
 		return
 	}
 	r.backlog = stats
+}
+
+// SetGuardObservation replaces the cached resource-guard snapshot. It does not sample.
+func (r *Registry) SetGuardObservation(obs GuardObservation) {
+	if r == nil {
+		return
+	}
+	r.guardObs.Store(obs)
+}
+
+// IncAdmissionDenied counts a refused spawn. workload and reason must already be closed enums.
+func (r *Registry) IncAdmissionDenied(workload, reason string) {
+	if r == nil || workload == "" || reason == "" {
+		return
+	}
+	key := workload + "|" + reason
+	val, _ := r.admissionDenied.LoadOrStore(key, &atomic.Uint64{})
+	val.(*atomic.Uint64).Add(1)
 }
 
 func (r *Registry) IncRequests()    { r.requestsTotal.Add(1) }
@@ -423,9 +468,130 @@ func (r *Registry) Handler() http.HandlerFunc {
 			}
 		}
 
+		r.writeResourceGuard(&b)
+
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write([]byte(b.String()))
 	}
+}
+
+func (r *Registry) writeResourceGuard(b *strings.Builder) {
+	obs, _ := r.guardObs.Load().(GuardObservation)
+	mode := obs.Mode
+	if mode == "" {
+		mode = r.cfg.ResourceGuard.Mode
+	}
+	if mode == "" {
+		mode = "observe"
+	}
+	fmt.Fprintf(b, "# TYPE eregion_resource_guard_mode gauge\n")
+	for _, name := range []string{"off", "observe", "enforce"} {
+		val := 0
+		if mode == name {
+			val = 1
+		}
+		fmt.Fprintf(b, "eregion_resource_guard_mode{mode=%q} %d\n", name, val)
+	}
+	state := obs.State
+	if state == "" {
+		state = "ok"
+	}
+	fmt.Fprintf(b, "# TYPE eregion_resource_guard_state gauge\n")
+	for _, name := range []string{"ok", "warning", "critical", "degraded"} {
+		val := 0
+		if state == name {
+			val = 1
+		}
+		fmt.Fprintf(b, "eregion_resource_guard_state{state=%q} %d\n", name, val)
+	}
+
+	sample := obs.Sample
+	fmt.Fprintf(b, "# TYPE eregion_resource_sample_valid gauge\n")
+	memValid := 0
+	if sample.MemoryKnown() {
+		memValid = 1
+	}
+	cpuValid := 0
+	if resources.Known(sample.CPUUtilizationValid) {
+		cpuValid = 1
+	}
+	throttleValid := 0
+	if resources.Known(sample.CPUThrottlingValid) {
+		throttleValid = 1
+	}
+	fmt.Fprintf(b, "eregion_resource_sample_valid{metric=%q} %d\n", "memory", memValid)
+	fmt.Fprintf(b, "eregion_resource_sample_valid{metric=%q} %d\n", "cpu_usage", cpuValid)
+	fmt.Fprintf(b, "eregion_resource_sample_valid{metric=%q} %d\n", "cpu_throttling", throttleValid)
+	if obs.AgeKnown {
+		fmt.Fprintf(b, "# TYPE eregion_resource_sample_age_seconds gauge\n")
+		fmt.Fprintf(b, "eregion_resource_sample_age_seconds %g\n", obs.AgeSeconds)
+	}
+	if resources.Known(sample.MemoryCurrentValid) {
+		fmt.Fprintf(b, "# TYPE eregion_resource_memory_current_bytes gauge\n")
+		fmt.Fprintf(b, "eregion_resource_memory_current_bytes %d\n", sample.MemoryCurrentBytes)
+	}
+	if obs.HeadroomKnown {
+		fmt.Fprintf(b, "# TYPE eregion_resource_memory_headroom_bytes gauge\n")
+		fmt.Fprintf(b, "eregion_resource_memory_headroom_bytes %d\n", obs.Headroom)
+	}
+	if resources.Known(sample.CPUUtilizationValid) {
+		fmt.Fprintf(b, "# TYPE eregion_resource_cpu_utilization_ratio gauge\n")
+		fmt.Fprintf(b, "eregion_resource_cpu_utilization_ratio %g\n", sample.CPUUtilization)
+	}
+	if resources.Known(sample.CPUThrottlingValid) {
+		fmt.Fprintf(b, "# TYPE eregion_resource_cpu_throttling_ratio gauge\n")
+		fmt.Fprintf(b, "eregion_resource_cpu_throttling_ratio %g\n", sample.CPUThrottledRatio)
+	}
+	horizon := obs.Horizon
+	if horizon == "" {
+		horizon = "60s"
+	}
+	pred := 0
+	if sample.PredictionValid {
+		pred = 1
+	}
+	fmt.Fprintf(b, "# TYPE eregion_resource_prediction_valid gauge\n")
+	fmt.Fprintf(b, "eregion_resource_prediction_valid{horizon=%q} %d\n", horizon, pred)
+	if sample.PredictionValid {
+		fmt.Fprintf(b, "# TYPE eregion_resource_memory_prediction_bytes gauge\n")
+		fmt.Fprintf(b, "eregion_resource_memory_prediction_bytes %d\n", sample.PredictionBytes)
+	}
+
+	if len(obs.Workloads) == 0 {
+		r.writeAdmissionDenied(b)
+		return
+	}
+	fmt.Fprintf(b, "# TYPE eregion_scaling_requested_workers gauge\n")
+	fmt.Fprintf(b, "# TYPE eregion_scaling_policy_target_workers gauge\n")
+	fmt.Fprintf(b, "# TYPE eregion_scaling_admitted_workers gauge\n")
+	fmt.Fprintf(b, "# TYPE eregion_scaling_limited_workers gauge\n")
+	fmt.Fprintf(b, "# TYPE eregion_scaling_would_limit_workers gauge\n")
+	fmt.Fprintf(b, "# TYPE eregion_scaling_capacity_deficit_workers gauge\n")
+	for _, wl := range obs.Workloads {
+		fmt.Fprintf(b, "eregion_scaling_requested_workers{workload=%q} %d\n", wl.Name, wl.Requested)
+		fmt.Fprintf(b, "eregion_scaling_policy_target_workers{workload=%q} %d\n", wl.Name, wl.Policy)
+		fmt.Fprintf(b, "eregion_scaling_admitted_workers{workload=%q} %d\n", wl.Name, wl.Admitted)
+		reason := wl.Reason
+		if reason == "" {
+			reason = "none"
+		}
+		fmt.Fprintf(b, "eregion_scaling_limited_workers{workload=%q,reason=%q} %d\n", wl.Name, reason, wl.Limited)
+		fmt.Fprintf(b, "eregion_scaling_would_limit_workers{workload=%q,reason=%q} %d\n", wl.Name, reason, wl.WouldLimit)
+		fmt.Fprintf(b, "eregion_scaling_capacity_deficit_workers{workload=%q} %d\n", wl.Name, wl.Deficit)
+	}
+	r.writeAdmissionDenied(b)
+}
+
+func (r *Registry) writeAdmissionDenied(b *strings.Builder) {
+	fmt.Fprintf(b, "# TYPE eregion_scaling_admission_denied_total counter\n")
+	r.admissionDenied.Range(func(k, v any) bool {
+		parts := strings.SplitN(k.(string), "|", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		fmt.Fprintf(b, "eregion_scaling_admission_denied_total{workload=%q,reason=%q} %d\n", parts[0], parts[1], v.(*atomic.Uint64).Load())
+		return true
+	})
 }
 
 // HealthHandler serves JSON health for the HTTP pool.

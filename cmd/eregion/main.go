@@ -173,6 +173,7 @@ func cmdCheck(args []string) int {
 		access = "unset"
 	}
 	fmt.Printf("  metrics_access=%s\n", access)
+	fmt.Printf("  resource_guard=%s\n", cfg.ResourceGuard.Mode)
 	resolved, err := cfg.ResolveWorkloads()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)

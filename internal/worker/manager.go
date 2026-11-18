@@ -20,6 +20,9 @@ type Manager struct {
 
 	mu    sync.RWMutex
 	pools map[string]*Pool
+
+	beforeStart func(context.Context) error
+	gate        SpawnGate
 }
 
 // NewManager creates an empty pool manager.
@@ -83,6 +86,9 @@ func (m *Manager) Ensure(spec workload.ResolvedWorkloadSpec) (*Pool, error) {
 		Max:      spec.Workers.Max,
 		MinReady: minReady,
 	})
+	if m.gate != nil {
+		p.SetSpawnGate(m.gate)
+	}
 	m.pools[spec.Name] = p
 	return p, nil
 }
@@ -111,8 +117,44 @@ func (m *Manager) List() []*Pool {
 	return out
 }
 
+// SetBeforeStart runs once at the beginning of StartAll.
+// A non-nil error prevents every pool from spawning.
+func (m *Manager) SetBeforeStart(fn func(context.Context) error) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.beforeStart = fn
+	m.mu.Unlock()
+}
+
+// SetSpawnGate attaches the same admission gate to every current and future pool.
+func (m *Manager) SetSpawnGate(g SpawnGate) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.gate = g
+	pools := make([]*Pool, 0, len(m.pools))
+	for _, p := range m.pools {
+		pools = append(pools, p)
+	}
+	m.mu.Unlock()
+	for _, p := range pools {
+		p.SetSpawnGate(g)
+	}
+}
+
 // StartAll starts every managed pool.
 func (m *Manager) StartAll(ctx context.Context) error {
+	m.mu.RLock()
+	fn := m.beforeStart
+	m.mu.RUnlock()
+	if fn != nil {
+		if err := fn(ctx); err != nil {
+			return err
+		}
+	}
 	m.mu.RLock()
 	pools := make([]*Pool, 0, len(m.pools))
 	for _, p := range m.pools {

@@ -87,6 +87,7 @@ type Pool struct {
 	guardRetryArmed bool
 	// after waits for a guard-probe delay. Tests replace it. Nil uses time.After.
 	after func(time.Duration) <-chan time.Time
+	gate  SpawnGate
 }
 
 type slot struct {
@@ -107,6 +108,7 @@ type slot struct {
 	// Zero means the next boot is not a measured replacement.
 	replaceStarted time.Time
 	replaceReason  string
+	grant          SpawnGrant
 }
 
 // NewPool builds a fixed HTTP worker pool from legacy config.
@@ -287,7 +289,9 @@ func (p *Pool) Start(ctx context.Context) error {
 					firstErr = err
 				}
 				mu.Unlock()
-				p.logger.Error("worker start failed", "slot", s.index, "error", err)
+				if !IsAdmissionDenial(err) {
+					p.logger.Error("worker start failed", "slot", s.index, "error", err)
+				}
 			}
 		}(s)
 	}
@@ -341,10 +345,32 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 	s.generation++
 	gen := s.generation
 	restartCount := s.restartCount
+	replacement := s.everBooted
+	gate := p.gate
 	p.mu.Unlock()
+
+	var grant SpawnGrant
+	if gate != nil {
+		var admitErr error
+		grant, admitErr = gate.Admit(SpawnRequest{
+			Workload:    p.name,
+			Slot:        s.index,
+			Generation:  gen,
+			Replacement: replacement,
+		})
+		if admitErr != nil {
+			if permit.Probe {
+				p.breaker.NoteProbeFailed()
+			}
+			return admitErr
+		}
+	}
 
 	w, err := p.starter.Start(p.ctx, s.index, gen, restartCount)
 	if err != nil {
+		if grant.ID != 0 {
+			gate.Release(grant)
+		}
 		if permit.Probe {
 			p.breaker.NoteProbeFailed()
 		}
@@ -364,14 +390,30 @@ func (p *Pool) bootSlot(s *slot, afterCrash bool) error {
 
 	p.mu.Lock()
 	if p.stopping || s.retired || s.index > p.desired {
+		old := s.grant
+		s.grant = SpawnGrant{}
 		p.mu.Unlock()
 		if permit.Probe {
 			p.breaker.NoteProbeFailed()
+		}
+		if grant.ID != 0 && gate != nil {
+			gate.Release(grant)
+		}
+		if old.ID != 0 && gate != nil {
+			gate.Release(old)
 		}
 		if w.cmd != nil {
 			_ = terminateProcess(w.cmd, p.cfg.Workers.ShutdownTimeout)
 		}
 		return ErrPoolShuttingDown
+	}
+	if grant.ID != 0 && gate != nil {
+		gate.Commit(grant)
+		if s.grant.ID != 0 && s.grant.ID != grant.ID {
+			old := s.grant
+			gate.Release(old)
+		}
+		s.grant = grant
 	}
 	s.worker = w
 	s.plannedExit = false
@@ -493,7 +535,17 @@ func (p *Pool) monitor(s *slot, w *Worker) {
 	s.worker = nil
 	stopping := p.stopping
 	retired := s.retired || s.index > p.desired
+	grant := SpawnGrant{}
+	gate := p.gate
+	if s.grant.ID != 0 && s.grant.Generation == w.Generation {
+		grant = s.grant
+		s.grant = SpawnGrant{}
+	}
 	p.mu.Unlock()
+
+	if grant.ID != 0 && gate != nil {
+		gate.ReleaseExit(grant)
+	}
 
 	// Drain this worker from idle channel if present.
 	p.purgeIdle(w)
@@ -591,8 +643,8 @@ func (p *Pool) scheduleRestart(s *slot, useBackoff bool) {
 			return
 		}
 		if err := p.bootSlot(s, useBackoff); err != nil {
-			if errors.Is(err, ErrGuardRestartSuppressed) {
-				p.logger.Info("guard recycle restart suppressed", "slot", s.index)
+			if IsAdmissionDenial(err) || errors.Is(err, ErrGuardRestartSuppressed) {
+				p.logger.Debug("restart held", "slot", s.index, "error", err)
 				return
 			}
 			p.logger.Error("restart failed", "slot", s.index, "error", err)
@@ -691,21 +743,64 @@ func (p *Pool) resumeDeferredGuardBoots() {
 	}
 }
 
+// SetSpawnGate installs the process admission gate. Nil keeps the historical unrestricted boot.
+func (p *Pool) SetSpawnGate(g SpawnGate) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.gate = g
+	p.mu.Unlock()
+}
+
 // SetDesired reconciles pool size toward n (clamped to min/max).
 // Scale-up boots new slots; scale-down drains idle/consumer workers only.
 func (p *Pool) SetDesired(n int) {
+	p.setTarget(n, false)
+}
+
+// SetAdmitted applies a resource-guard target. It may sit below workers.min and
+// still uses the existing drain path. It does not add a kill signal.
+func (p *Pool) SetAdmitted(n int) {
+	p.mu.Lock()
+	started := p.started
+	if !started {
+		if n < 0 {
+			n = 0
+		}
+		if p.maxW > 0 && n > p.maxW {
+			n = p.maxW
+		}
+		p.desired = n
+		if p.minReady > n {
+			p.minReady = n
+		}
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	p.setTarget(n, true)
+}
+
+func (p *Pool) setTarget(n int, allowBelowMin bool) {
 	p.mu.Lock()
 	if p.stopping {
 		p.mu.Unlock()
 		return
 	}
-	if n < p.minW {
+	if !allowBelowMin && n < p.minW {
 		n = p.minW
+	}
+	if n < 0 {
+		n = 0
 	}
 	if p.maxW > 0 && n > p.maxW {
 		n = p.maxW
 	}
 	old := p.desired
+	if allowBelowMin && n < p.minReady {
+		p.minReady = n
+	}
 	if n == old && len(p.slots) >= n {
 		// Still ensure non-retired slots are booted.
 		needBoot := false
@@ -781,8 +876,8 @@ func (p *Pool) SetDesired(n int) {
 	for _, s := range toBoot {
 		go func(s *slot) {
 			if err := p.bootSlot(s, false); err != nil {
-				if errors.Is(err, ErrGuardRestartSuppressed) {
-					p.logger.Info("guard recycle restart suppressed", "slot", s.index)
+				if IsAdmissionDenial(err) || errors.Is(err, ErrGuardRestartSuppressed) {
+					p.logger.Debug("scale-up boot held", "slot", s.index, "error", err)
 					return
 				}
 				p.logger.Error("scale-up boot failed", "slot", s.index, "error", err)
@@ -1083,7 +1178,20 @@ func (p *Pool) HealthyCount() int {
 func (p *Pool) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
 	p.stopping = true
+	gate := p.gate
+	grants := make([]SpawnGrant, 0, len(p.slots))
+	for _, s := range p.slots {
+		if s.grant.ID != 0 {
+			grants = append(grants, s.grant)
+			s.grant = SpawnGrant{}
+		}
+	}
 	p.mu.Unlock()
+	if gate != nil {
+		for _, grant := range grants {
+			gate.Release(grant)
+		}
+	}
 	if p.cancel != nil {
 		p.cancel()
 	}

@@ -11,9 +11,9 @@ import (
 
 func TestFixedStrategy(t *testing.T) {
 	spec := workload.ResolvedWorkloadSpec{
-		Name:    "w",
-		Workers: workload.WorkerPolicy{Min: 2, Max: 2},
-		Scaling: workload.DefaultScaling(),
+		Name:      "w",
+		Workers:   workload.WorkerPolicy{Min: 2, Max: 2},
+		Scaling:   workload.DefaultScaling(),
 		Resources: workload.DefaultResources(),
 	}
 	n := scaling.Fixed{}.DesiredWorkers(spec, workload.WorkloadMetrics{}, resources.RuntimeResources{})
@@ -59,6 +59,76 @@ func TestBacklogWithProvider(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("got %d want 5", n)
 	}
+}
+
+func TestECO09T01ClampDesiredDoesNotReapplyMin(t *testing.T) {
+	spec := workload.ResolvedWorkloadSpec{
+		Name:      "w",
+		Workers:   workload.WorkerPolicy{Min: 4, Max: 8},
+		Resources: workload.ResourcePolicy{MemoryMB: 512},
+		Scaling:   workload.DefaultScaling(),
+	}
+	runtime := resources.RuntimeResources{
+		MemoryLimitBytes: 1 << 30,
+		MemoryLimitKnown: true,
+	}
+	n := scaling.ClampDesired(8, 4, 8, spec, runtime)
+	if n > 2 {
+		t.Fatalf("hard cap admitted %d, want <= 2", n)
+	}
+	legacy := scaling.Fixed{}.DesiredWorkers(spec, workload.WorkloadMetrics{}, runtime)
+	if legacy != 4 {
+		t.Fatalf("legacy desired = %d, want 4 so observe keeps the historical minimum", legacy)
+	}
+}
+
+func TestECO09T10ResourcesIgnoreGOMAXPROCS(t *testing.T) {
+	spec := workload.ResolvedWorkloadSpec{
+		Name:      "php",
+		Workers:   workload.WorkerPolicy{Min: 1, Max: 64},
+		Resources: workload.ResourcePolicy{Class: workload.ClassIO},
+		Scaling:   workload.DefaultScaling(),
+	}
+	runtime := resources.RuntimeResources{
+		AvailableCPUs: 2,
+		GOMAXPROCS:    1,
+		LogicalCPUs:   8,
+	}
+	ev := scaling.Resources{}.Evaluate(spec, workload.WorkloadMetrics{}, runtime)
+	if ev.RawDemand != 8 {
+		t.Fatalf("raw demand = %d, want 8 (2 vCPU * io 4); GOMAXPROCS must not cap PHP workers", ev.RawDemand)
+	}
+}
+
+func TestBacklogEvaluateReadsProviderOnce(t *testing.T) {
+	spec := workload.ResolvedWorkloadSpec{
+		Name:    "jobs",
+		Workers: workload.WorkerPolicy{Min: 1, Max: 8},
+		Scaling: workload.ScalingPolicy{
+			Strategy:        workload.StrategyBacklog,
+			AvgJobDuration:  time.Second,
+			TargetDrainTime: 10 * time.Second,
+		},
+		Resources: workload.DefaultResources(),
+	}
+	counter := &countingBacklog{n: 50}
+	ev := (scaling.Backlog{Provider: counter}).Evaluate(spec, workload.WorkloadMetrics{}, resources.RuntimeResources{})
+	if counter.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", counter.calls)
+	}
+	if ev.RawDemand != 5 || ev.LegacyTarget != 5 {
+		t.Fatalf("evaluation = %+v, want raw 5 legacy 5", ev)
+	}
+}
+
+type countingBacklog struct {
+	n     int
+	calls int
+}
+
+func (c *countingBacklog) Backlog(string) (int, bool) {
+	c.calls++
+	return c.n, true
 }
 
 func TestResourceClamp(t *testing.T) {

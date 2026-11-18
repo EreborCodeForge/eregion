@@ -40,6 +40,10 @@ type Config struct {
 	// WorkerGuardRecycle limits replacement boots caused by guard_state_violation.
 	// It does not inspect PHP state and does not change EREGION/1.
 	WorkerGuardRecycle GuardRecycleSafetyConfig
+
+	// ResourceGuard is the global resource safety controller.
+	// Missing YAML keeps Mode observe so existing projects do not change worker counts.
+	ResourceGuard ResourceGuardConfig
 }
 
 // WorkloadTemplateConfig is the YAML/runtime form of a workload template.
@@ -273,6 +277,7 @@ func Default() Config {
 			RecoverySuccessfulRequests: 20,
 			RecoveryMinUptime:          30 * time.Second,
 		},
+		ResourceGuard: DefaultResourceGuard(),
 	}
 	_ = cfg.ResolveEndpoints()
 	return cfg

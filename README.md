@@ -102,6 +102,36 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 - `--workers` recomputes derived `queue.capacity` (`count * 8`) when capacity was not set explicitly in YAML
 - Unknown YAML fields fail startup
 - At startup Eregion **detects** available CPU/memory by resolving the **current process cgroup** (leaf under `/sys/fs/cgroup`, not only the cgroup root; falls back to `GOMAXPROCS` / `NumCPU` outside limits) and logs a **worker sizing recommendation**. This is advisory only: configured worker bounds remain authoritative. `GOMAXPROCS` does **not** cap PHP worker processes. Oversized pools (`workers_per_cpu > 8`) emit WARN but still start. Metrics include `eregion_runtime_cpu_*`, `eregion_runtime_memory_limit_bytes`, `eregion_workers_per_cpu`, and `eregion_workers_recommended{,_min,_max}` (cached once; `eregion_workers_desired` is the HTTP pool desired count)
+- `resource_guard` (default `observe`) plans a shared CPU/memory budget without changing worker counts. `enforce` is opt-in and refuses new processes that would pass the admission budget, including the initial boot. It does not kill busy workers and it does not speak a different `EREGION/1`. `off` leaves scaling on the previous path. Missing cgroup data is reported as unknown; it is not treated as zero usage or as infinite capacity.
+- `resource_guard.memory.hard_limit_mb` is an admission budget, not a memory limit imposed by the operating system. It does not write `memory.max`, an rlimit, or a cgroup. The kernel can still let an already admitted process grow past that number. In `enforce`, a known cgroup limit and this budget combine as the smaller of the two; without a known cgroup limit, the budget applies only to the measured RSS of the managed process tree. See [`docs/resource-guard.md`](docs/resource-guard.md).
+
+Example `resource_guard` block:
+
+```yaml
+resource_guard:
+  mode: observe
+  sample_interval: 1s
+  max_sample_age: 5s
+  memory:
+    reserve_mb: 256
+    hard_limit_mb: 0
+    reserve_percent: 10
+    worker_fallback_mb: 256
+    warning_ratio: 0.80
+    critical_ratio: 0.90
+    hard_ratio: 0.95
+  cpu:
+    warning_utilization_ratio: 0.85
+    critical_throttling_ratio: 0.20
+  prediction:
+    enabled: true
+    horizon: 60s
+    min_samples: 10
+  warnings:
+    dedupe_window: 60s
+```
+
+`eregion check` validates this block and does not start workers or claim a live capacity number.
 
 Example consumer workload (see also [`docs/workloads-spec.md`](docs/workloads-spec.md)):
 

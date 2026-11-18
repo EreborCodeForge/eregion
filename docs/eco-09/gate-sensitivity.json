@@ -1,0 +1,26 @@
+{
+  "official_artifact": "/home/thales/wslbench/mithrilphp/bench/results/resource-guard-ab.json",
+  "official_series": "all 20 paired rounds, including the last pair",
+  "official_verdict": "PASS",
+  "official_t": 2.093,
+  "official_degrees_of_freedom": 19,
+  "discrepant_pair": {
+    "round": 20,
+    "order": "observe, enforce, off",
+    "rps_drop_percent": -7.9514765175780378,
+    "p99_rise_percent": -11.214661623275346,
+    "note": "off ran last, after the machine had already slowed. observe was faster. The point stays in the official series."
+  },
+  "sensitivity_excluding_last_pair": {
+    "role": "analysis only; not a gate and not a replacement verdict",
+    "pairs": 19,
+    "t": 2.1009220402417,
+    "degrees_of_freedom": 18,
+    "rps_drop_median": 0.06753894087684355,
+    "rps_drop_mean": -0.08237635240966579,
+    "rps_drop_ci95": [-0.4216472773007259, 0.2568945724813943],
+    "p99_rise_median": 0.15216113882273932,
+    "p99_rise_mean": -0.12921553971030197,
+    "p99_rise_ci95": [-0.716511742780094, 0.45808066335949005]
+  }
+}

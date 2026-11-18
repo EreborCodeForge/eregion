@@ -1,9 +1,11 @@
 package server
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/EreborCodeForge/Eregion/internal/config"
@@ -66,5 +68,29 @@ func TestDisabledMetricsStayNotFound(t *testing.T) {
 	srv.http.Handler.ServeHTTP(live, httptest.NewRequest(http.MethodGet, srv.cfg.Liveness.Path, nil))
 	if live.Code == http.StatusNotFound {
 		t.Fatalf("liveness disappeared: %d", live.Code)
+	}
+}
+
+func TestECO09T34GuardMetricsRespectLoopback(t *testing.T) {
+	cfg := config.Default()
+	cfg.Socket.Directory = t.TempDir()
+	cfg.Metrics.Access = "loopback"
+	srv, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := httptest.NewRequest(http.MethodGet, srv.cfg.Metrics.Path, nil)
+	remote.RemoteAddr = "10.2.2.2:9"
+	rec := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(rec, remote)
+	if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "eregion_resource_guard_mode") {
+		t.Fatalf("remote code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	local := httptest.NewRequest(http.MethodGet, srv.cfg.Metrics.Path, nil)
+	local.RemoteAddr = "127.0.0.1:9"
+	ok := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(ok, local)
+	if ok.Code != http.StatusOK || !strings.Contains(ok.Body.String(), `eregion_resource_guard_mode{mode="observe"} 1`) {
+		t.Fatalf("local code=%d body=%s", ok.Code, ok.Body.String())
 	}
 }

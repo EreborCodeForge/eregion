@@ -38,6 +38,8 @@ type Server struct {
 	shuttingDown atomic.Bool
 	reconciler   *reconciler.Reconciler
 	backlog      *scaling.HTTPJSONBacklogProvider
+	collector    *resources.Collector
+	guard        *scaling.Guard
 }
 
 // New constructs a server from config.
@@ -106,6 +108,15 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		metrics.SetBacklogStats(backlog)
 	}
 	rec := reconciler.New(registry, pools, strategies, runtimeRes, logger)
+	collector, guard := newResourceGuard(cfg, metrics, logger)
+	rec.SetGuard(guard)
+	if cfg.ResourceGuard.Mode == "enforce" && guard != nil && guard.Ledger != nil {
+		pools.SetSpawnGate(guard.Ledger)
+		resolvedCopy := append([]workload.ResolvedWorkloadSpec(nil), resolved...)
+		pools.SetBeforeStart(func(ctx context.Context) error {
+			return guard.Preflight(ctx, resolvedCopy, pools)
+		})
+	}
 
 	mux := http.NewServeMux()
 	s := &Server{
@@ -120,6 +131,8 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		workerSizing: workerSizing,
 		reconciler:   rec,
 		backlog:      backlog,
+		collector:    collector,
+		guard:        guard,
 	}
 
 	if cfg.Liveness.Enabled {
@@ -188,6 +201,9 @@ func (s *Server) Run(ctx context.Context) error {
 	sizing.LogRuntimeResources(s.logger, s.runtimeRes, s.workerSizing)
 	sizing.LogMemoryEnvelope(s.logger, s.runtimeRes, s.cfg.Workers.Count, s.cfg.Workers.MemoryLimitMB)
 
+	if s.collector != nil {
+		go s.collector.Run(ctx)
+	}
 	if err := s.pools.StartAll(ctx); err != nil {
 		return fmt.Errorf("start workers: %w", err)
 	}
@@ -239,6 +255,42 @@ func guardMetrics(next http.HandlerFunc, access string) http.HandlerFunc {
 			return
 		}
 		next(w, r)
+	}
+}
+
+func newResourceGuard(cfg config.Config, metrics *telemetry.Registry, logger *slog.Logger) (*resources.Collector, *scaling.Guard) {
+	if cfg.ResourceGuard.Mode == "off" {
+		return nil, &scaling.Guard{Cfg: cfg.ResourceGuard, Logger: logger, Metrics: metrics}
+	}
+	var predict *resources.Predictor
+	if cfg.ResourceGuard.Prediction.Enabled {
+		predict = &resources.Predictor{
+			MinSamples: cfg.ResourceGuard.Prediction.MinSamples,
+			Horizon:    cfg.ResourceGuard.Prediction.Horizon,
+		}
+	}
+	collector := &resources.Collector{
+		Sampler:  &resources.CgroupSampler{Clock: resources.SystemClock{}},
+		Interval: cfg.ResourceGuard.SampleInterval,
+		MaxAge:   cfg.ResourceGuard.MaxSampleAge,
+		Clock:    resources.SystemClock{},
+		Predict:  predict,
+	}
+	ledger := scaling.NewLedger()
+	ledger.SetDenyHandler(func(workload string, reason scaling.LimitReason) {
+		metrics.IncAdmissionDenied(workload, string(reason))
+	})
+	return collector, &scaling.Guard{
+		Cfg:       cfg.ResourceGuard,
+		Collector: collector,
+		Ledger:    ledger,
+		Managed:   resources.ProcessTreeRSS,
+		Warner: &scaling.Warner{
+			Window: cfg.ResourceGuard.Warnings.DedupeWindow,
+			Clock:  resources.SystemClock{},
+		},
+		Logger:  logger,
+		Metrics: metrics,
 	}
 }
 
