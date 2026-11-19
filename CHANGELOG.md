@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased — ECO-09 Resource Guard
+## 0.4.4 — Resource Guard
+
+Ver [`docs/releases/0.4.4.md`](docs/releases/0.4.4.md).
 
 O protocolo continua `eregion/1`. Nenhuma estratégia de scaling foi adicionada e os limites de admissão não foram afrouxados para passar o gate.
 
