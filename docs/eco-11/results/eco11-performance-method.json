@@ -1,0 +1,31 @@
+{
+  "application": "MithrilPHP bench/http/App.php",
+  "baseline_revision": "7d6463764aeb965e8dfe4644237139f28dec9ef6",
+  "baseline_sha256": "984cb98e07b1fcea028b6b380c0cb674e593c5d3f8c7f534852e8014e867320e",
+  "candidate_sha256": "5722cc8c6118b37330665e1c588afbfb7d18a45383a5bead2b93e42e1fa5d109",
+  "clients": 4,
+  "clock_utc": "2026-11-24T00:12:47Z",
+  "command": "EREGION_ECO11_BENCH=1 go test -count=1 -timeout 6h -run TestECO11PerformanceGate ./tests/integration/",
+  "comparisons": [
+    "legacy_observe: frozen ECO-09 binary versus the working tree, identical fixed HTTP plus backlog consumer, resource_guard observe",
+    "scheduled_overhead: candidate fixed versus scheduled default_workers=2, min=max, resource_guard enforce",
+    "cpu_minmax_overhead: candidate fixed versus cpu_utilization min=max, resource_guard enforce"
+  ],
+  "consumer": "backlog strategy, http_json depth 0, min=max=1",
+  "go": "go version go1.27.4 linux/amd64",
+  "goroutines": "not exported by the supervisor; OS threads from /proc are recorded instead",
+  "http_workers": 2,
+  "load": "external httptest-independent generator in the test process; eregion serve is a separate process group",
+  "mem_total": "MemTotal:       20398892 kB",
+  "nproc": "28",
+  "os": "linux/amd64 Linux DESKTOP-CFAIQ33 5.15.146.1-microsoft-standard-WSL2 #1 SMP Thu Jan 11 04:09:03 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux",
+  "outliers": "retained; no sample is removed from the official series",
+  "p99_rise_limit_pct": 5,
+  "php": "/usr/bin/php PHP 8.5.9 (cli) (built: Jul 30 2026 15:13:42) (NTS)",
+  "protocol": "20 paired rounds, AB/BA balanced 10/10, 5s warmup after readiness, 60s measured window",
+  "rounds": 20,
+  "rps_drop_limit_pct": 2,
+  "student_t_df19": 2.093,
+  "warmup": "5s",
+  "window": "1m0s"
+}
