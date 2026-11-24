@@ -19,6 +19,7 @@ import (
 
 	"github.com/EreborCodeForge/Eregion/internal/config"
 	"github.com/EreborCodeForge/Eregion/internal/server"
+	"github.com/EreborCodeForge/Eregion/internal/socket"
 )
 
 func fixturesDir(t *testing.T) string {
@@ -70,11 +71,63 @@ func testConfig(t *testing.T, workerScript string) config.Config {
 	cfg.Workers.ShutdownTimeout = 2 * time.Second
 	cfg.Workers.MaxRequests = 0
 	cfg.Queue.Capacity = 8
-	cfg.Socket.Directory = filepath.Join(t.TempDir(), "socks")
+	cfg.Socket.Directory = shortSocketDir(t)
 	cfg.Logging.Level = "error"
 	cfg.Logging.Format = "text"
 	cfg.Logging.AccessLog = false
 	return cfg
+}
+
+// shortSocketDir is an isolated directory whose final worker socket stays
+// under the platform AF_UNIX limit. t.TempDir includes the test name, and on
+// Windows that pushes paths to 108 bytes or more, which PHP socket_bind rejects.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	parent := shortTempParent(t)
+	dir, err := os.MkdirTemp(parent, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sample := filepath.Join(dir, "http", "worker-2-1.sock")
+	if err := socket.ValidateBindPath(sample); err != nil {
+		t.Fatalf("socket path still too long (%d bytes): %s", len(sample), sample)
+	}
+	return dir
+}
+
+func shortTempParent(t *testing.T) string {
+	t.Helper()
+	candidates := []string{filepath.Join(os.TempDir(), "e")}
+	if runtime.GOOS == "windows" {
+		if drive := os.Getenv("SystemDrive"); drive != "" {
+			candidates = append([]string{drive + `\e`}, candidates...)
+		}
+	} else {
+		candidates = append([]string{"/tmp/e"}, candidates...)
+	}
+	var first error
+	for _, dir := range candidates {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		probe, err := os.CreateTemp(dir, "p")
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		name := probe.Name()
+		_ = probe.Close()
+		_ = os.Remove(name)
+		return dir
+	}
+	t.Fatalf("short temp parent: %v", first)
+	return ""
 }
 
 func startServer(t *testing.T, cfg config.Config) string {
@@ -459,7 +512,6 @@ func TestStartupFailure(t *testing.T) {
 	}
 }
 
-// Socket paths on Windows are limited to about 108 bytes, so these test names stay short.
 func TestWGRecycle(t *testing.T) {
 	cfg := testConfig(t, filepath.Join(fixturesDir(t), "guard-recycle-worker.php"))
 	base := startServer(t, cfg)

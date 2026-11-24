@@ -1,0 +1,4 @@
+latency:
+  target_p95: 100ms
+  queue_wait_target_p95: 10ms
+  busy_threshold: 0.85

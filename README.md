@@ -46,6 +46,8 @@ protocol eregion/1
 
 **0.4.4** keeps protocol `eregion/1` and the existing scaling strategies. `resource_guard` defaults to `observe`. `enforce` refuses new processes that would pass the admission budget, and `hard_limit_mb` is that budget rather than an operating-system memory limit. The VPS and Forge must install this GitHub Release asset into `.mithril/bin/eregion`. Do not benchmark or deploy a binary produced with `go build` from a clone.
 
+The unpublished tree adds opt-in `cpu_utilization`, `latency`, `throughput`, `hybrid`, `scheduled` and `adaptive`. Omitting those blocks leaves `fixed`, `backlog` and `resources` on the previous path. There is no release tag for that work. Local evidence is [`docs/eco-11/RELATORIO.md`](docs/eco-11/RELATORIO.md). The official benchmark artifact is [`docs/eco-11/results/eco11-performance.json`](docs/eco-11/results/eco11-performance.json).
+
 ## Requirements (from source)
 
 - Go 1.23+
@@ -90,7 +92,7 @@ See also [`eregion.yaml.example`](eregion.yaml.example).
 - Legacy `php` + `workers` + `queue` config still works and is adapted to a single `http` workload
 - Optional `workload_templates` / `workloads` declare additional (or only) workloads; `command` is an argv array (no shell)
 - Consumer mode does not speak EREGION/1; the broker client stays in PHP/Mithril
-- Scaling strategies: `fixed`, `backlog` (needs a backlog provider; otherwise stays at `workers.min`), `resources`
+- Published scaling strategies: `fixed`, `backlog` (needs a backlog provider; otherwise stays at `workers.min`), `resources`. The unreleased strategies are documented in [`docs/scaling-strategies.md`](docs/scaling-strategies.md)
 - Per-workload metrics: `eregion_workload_*{workload=...}` including desired/running/busy/draining/failed workers, restarts, and scale events
 - `workers.handshake_timeout` lives under `workers` (not `protocol`)
 - Transport and codec are fixed in v1: UDS + MessagePack

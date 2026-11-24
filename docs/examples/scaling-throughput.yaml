@@ -1,0 +1,4 @@
+throughput:
+  target_rps_per_worker: 50
+scale_up_cooldown: 10s
+scale_down_idle_for: 30s

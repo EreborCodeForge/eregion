@@ -106,27 +106,43 @@ func Resolve(spec WorkloadSpec, templates map[string]WorkloadTemplate) (Resolved
 		if out.Scaling.Strategy == "" {
 			out.Scaling.Strategy = StrategyFixed
 		}
+	case StrategyCPUUtilization, StrategyLatency, StrategyThroughput, StrategyHybrid, StrategyScheduled, StrategyAdaptive:
 	default:
 		return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: unknown scaling strategy %q", spec.Name, out.Scaling.Strategy)
 	}
-	if out.Scaling.Strategy == StrategyBacklog {
+	if out.Scaling.Strategy == StrategyBacklog || needsBacklogSource(out) {
 		src := out.Scaling.BacklogSource
-		if src.Type != "http_json" || src.URLEnv == "" {
+		if out.Scaling.Strategy == StrategyBacklog && (src.Type != "http_json" || src.URLEnv == "") {
 			return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: strategy backlog requires backlog_source.type=http_json and url_env", spec.Name)
 		}
-		if src.Timeout <= 0 {
-			src.Timeout = 250 * time.Millisecond
+		if src.Type != "" {
+			if src.Timeout <= 0 {
+				src.Timeout = 250 * time.Millisecond
+			}
+			if src.Timeout > time.Second {
+				return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: backlog_source.timeout must be <= 1s", spec.Name)
+			}
+			if src.MaxStaleness <= 0 {
+				src.MaxStaleness = 5 * time.Second
+			}
+			out.Scaling.BacklogSource = src
 		}
-		if src.Timeout > time.Second {
-			return ResolvedWorkloadSpec{}, fmt.Errorf("workload %q: backlog_source.timeout must be <= 1s", spec.Name)
-		}
-		if src.MaxStaleness <= 0 {
-			src.MaxStaleness = 5 * time.Second
-		}
-		out.Scaling.BacklogSource = src
 	}
+	out.Scaling = ApplyAdvancedDefaults(out.Scaling)
 
 	return out, nil
+}
+
+func needsBacklogSource(spec ResolvedWorkloadSpec) bool {
+	if spec.Scaling.BacklogSource.Type == "" {
+		return false
+	}
+	switch spec.Scaling.Strategy {
+	case StrategyHybrid, StrategyCPUUtilization:
+		return true
+	default:
+		return false
+	}
 }
 
 func mergeScaling(base, over ScalingPolicy) ScalingPolicy {
@@ -148,6 +164,30 @@ func mergeScaling(base, over ScalingPolicy) ScalingPolicy {
 	}
 	if over.BacklogSource.Type != "" {
 		out.BacklogSource = over.BacklogSource
+	}
+	if over.CooldownSet {
+		out.CooldownSet = true
+	}
+	if over.IdleSet {
+		out.IdleSet = true
+	}
+	if over.Control.Configured {
+		out.Control = over.Control
+	}
+	if over.CPU.Configured {
+		out.CPU = over.CPU
+	}
+	if over.Latency.Configured {
+		out.Latency = over.Latency
+	}
+	if over.Throughput.Configured {
+		out.Throughput = over.Throughput
+	}
+	if over.Scheduled.Configured {
+		out.Scheduled = over.Scheduled
+	}
+	if over.Adaptive.Configured {
+		out.Adaptive = over.Adaptive
 	}
 	return out
 }

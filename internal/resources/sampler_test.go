@@ -166,3 +166,29 @@ func TestCollectorDoesNotSampleOnCurrent(t *testing.T) {
 		t.Fatalf("validity=%s", stale.MemoryLimitValid)
 	}
 }
+
+func TestHybridCgroup2MountFeedsCPUWithoutQuota(t *testing.T) {
+	files := mapFiles{
+		"/proc/self/cgroup":                          []byte("0::/init.scope\n"),
+		"/proc/self/mountinfo":                       []byte("115 114 0:21 / /sys/fs/cgroup/unified rw,nosuid - cgroup2 cgroup2 rw\n"),
+		"/sys/fs/cgroup/unified/init.scope/cpu.stat": []byte("usage_usec 1000\nuser_usec 1000\nsystem_usec 0\n"),
+	}
+	now := time.Unix(100, 0)
+	s := &CgroupSampler{Reader: files, Root: "/sys/fs/cgroup", Clock: FuncClock(func() time.Time { return now })}
+	if _, err := s.Sample(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	files["/sys/fs/cgroup/unified/init.scope/cpu.stat"] = []byte("usage_usec 1100000\nuser_usec 1100000\nsystem_usec 0\n")
+	now = now.Add(time.Second)
+	s.Clock = FuncClock(func() time.Time { return now })
+	got, err := s.Sample(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CPUUtilizationValid != ValidityKnown || got.CPUUtilization <= 0 {
+		t.Fatalf("utilization=%s %g", got.CPUUtilizationValid, got.CPUUtilization)
+	}
+	if got.CPUThrottlingValid != ValidityKnown || got.CPUThrottledRatio != 0 {
+		t.Fatalf("throttle=%s %g", got.CPUThrottlingValid, got.CPUThrottledRatio)
+	}
+}

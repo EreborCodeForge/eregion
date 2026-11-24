@@ -13,6 +13,7 @@ import (
 	"github.com/EreborCodeForge/Eregion/internal/craft"
 	applog "github.com/EreborCodeForge/Eregion/internal/logging"
 	"github.com/EreborCodeForge/Eregion/internal/protocol"
+	"github.com/EreborCodeForge/Eregion/internal/scaling/signals"
 	"github.com/EreborCodeForge/Eregion/internal/server"
 )
 
@@ -174,6 +175,11 @@ func cmdCheck(args []string) int {
 	}
 	fmt.Printf("  metrics_access=%s\n", access)
 	fmt.Printf("  resource_guard=%s\n", cfg.ResourceGuard.Mode)
+	if signals.WorkerCPUSupported() {
+		fmt.Printf("  worker_cpu=supported\n")
+	} else {
+		fmt.Printf("  worker_cpu=unsupported\n")
+	}
 	resolved, err := cfg.ResolveWorkloads()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
@@ -181,7 +187,7 @@ func cmdCheck(args []string) int {
 	}
 	fmt.Printf("  workloads=%d\n", len(resolved))
 	for _, w := range resolved {
-		fmt.Printf("    - %s mode=%s workers=%d..%d\n", w.Name, w.Mode, w.Workers.Min, w.Workers.Max)
+		fmt.Printf("    - %s mode=%s strategy=%s workers=%d..%d\n", w.Name, w.Mode, w.Scaling.Strategy, w.Workers.Min, w.Workers.Max)
 	}
 	return 0
 }

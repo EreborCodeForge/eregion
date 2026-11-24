@@ -35,8 +35,11 @@ type backlogState struct {
 func NewHTTPJSONBacklogProvider(specs []workload.ResolvedWorkloadSpec) *HTTPJSONBacklogProvider {
 	sources := make(map[string]workload.BacklogSource)
 	for _, spec := range specs {
-		if spec.Scaling.Strategy == workload.StrategyBacklog && spec.Scaling.BacklogSource.Type == "http_json" {
-			sources[spec.Name] = spec.Scaling.BacklogSource
+		switch spec.Scaling.Strategy {
+		case workload.StrategyBacklog, workload.StrategyHybrid, workload.StrategyCPUUtilization:
+			if spec.Scaling.BacklogSource.Type == "http_json" {
+				sources[spec.Name] = spec.Scaling.BacklogSource
+			}
 		}
 	}
 	if len(sources) == 0 {
@@ -98,6 +101,42 @@ func (p *HTTPJSONBacklogProvider) Stats(workloadName string) (messages int, meas
 		return 0, false, age, true
 	}
 	return cur.value, true, age, true
+}
+
+// Snapshot reads the cache. It does not fetch. valid is false when the sample is missing or older than max staleness.
+func (p *HTTPJSONBacklogProvider) Snapshot(workloadName string, now time.Time) (value int, valid bool, at time.Time, configured bool) {
+	if p == nil {
+		return 0, false, time.Time{}, false
+	}
+	src, ok := p.sources[workloadName]
+	if !ok {
+		return 0, false, time.Time{}, false
+	}
+	p.mu.Lock()
+	cur := p.state[workloadName]
+	p.mu.Unlock()
+	if !cur.ok || cur.successAt.IsZero() {
+		return 0, false, cur.successAt, true
+	}
+	maxAge := src.MaxStaleness
+	if maxAge <= 0 {
+		maxAge = 5 * time.Second
+	}
+	if now.Before(cur.successAt) || now.Sub(cur.successAt) > maxAge {
+		return cur.value, false, cur.successAt, true
+	}
+	return cur.value, true, cur.successAt, true
+}
+
+// Refresh fetches when the cache is missing or stale. A fresh cache is not polled again.
+func (p *HTTPJSONBacklogProvider) Refresh(workloadName string, now time.Time) {
+	if p == nil {
+		return
+	}
+	if _, valid, _, configured := p.Snapshot(workloadName, now); !configured || valid {
+		return
+	}
+	_, _ = p.Backlog(workloadName)
 }
 
 // Close releases idle connections. Safe on nil.

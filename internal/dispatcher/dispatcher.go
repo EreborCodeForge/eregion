@@ -102,6 +102,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if d.metrics != nil {
 			d.metrics.IncError("body")
 			d.metrics.ObserveDuration(time.Since(start).Seconds())
+			noteClass(d.metrics, "client_error", time.Since(start).Seconds(), 0)
 		}
 		http.Error(w, `{"error":"request_entity_too_large","message":"Request body exceeds configured limit."}`, http.StatusRequestEntityTooLarge)
 		d.accessLog("method", r.Method, "path", r.URL.Path, "status", http.StatusRequestEntityTooLarge,
@@ -120,6 +121,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				d.metrics.IncQueueReject()
 				d.metrics.IncError("capacity")
 				d.metrics.ObserveDuration(time.Since(start).Seconds())
+				noteClass(d.metrics, "local_reject", time.Since(start).Seconds(), 0)
 			}
 			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"error":   "server_capacity_exceeded",
@@ -143,6 +145,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if d.metrics != nil {
 				d.metrics.IncError("acquire")
 				d.metrics.ObserveDuration(time.Since(start).Seconds())
+				noteClass(d.metrics, "local_reject", time.Since(start).Seconds(), queueWait.Seconds())
 			}
 			d.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"error":   "server_capacity_exceeded",
@@ -194,6 +197,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if d.metrics != nil {
 			d.metrics.IncError(errKind)
 			d.metrics.ObserveDuration(time.Since(start).Seconds())
+			noteClass(d.metrics, "server_error", time.Since(start).Seconds(), queueWait.Seconds())
 		}
 		if timedOut {
 			http.Error(w, `{"error":"gateway_timeout","message":"Worker request timed out."}`, http.StatusGatewayTimeout)
@@ -228,6 +232,7 @@ func (d *Dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if d.metrics != nil {
 		d.metrics.ObserveDuration(time.Since(start).Seconds())
+		noteClass(d.metrics, classOf(int(resp.Status)), time.Since(start).Seconds(), queueWait.Seconds())
 	}
 	attrs := []any{
 		"request_id", reqID,
@@ -311,4 +316,24 @@ func remoteAddr(r *http.Request) string {
 func isTimeoutErr(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func noteClass(m Metrics, class string, duration, queueWait float64) {
+	type observer interface {
+		ObserveClass(class string, duration, queueWait float64)
+	}
+	if o, ok := m.(observer); ok {
+		o.ObserveClass(class, duration, queueWait)
+	}
+}
+
+func classOf(status int) string {
+	switch {
+	case status >= 200 && status < 400:
+		return "success"
+	case status >= 400 && status < 500:
+		return "client_error"
+	default:
+		return "server_error"
+	}
 }

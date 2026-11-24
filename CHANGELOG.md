@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — ECO-11
+
+Estratégias opt-in `cpu_utilization`, `latency`, `throughput`, `hybrid`, `scheduled` e `adaptive`. A admissão continua no planner e no ledger já existentes. Sem configuração nova, a captura extra de sinais fica desligada e `fixed`, `resources` e `backlog` mantêm o cooldown padrão de 1s. `cpu_utilization` e `adaptive` exigem leitura de CPU por PID e falham em `check` quando a plataforma não oferece essa leitura. O fechamento local está em [`docs/eco-11/RELATORIO.md`](docs/eco-11/RELATORIO.md). Nenhuma tag foi criada. Distribuição publicada desta mudança permanece fechada. Ver [`docs/scaling-strategies.md`](docs/scaling-strategies.md).
+
 ## 0.4.4 — Resource Guard
 
 Ver [`docs/releases/0.4.4.md`](docs/releases/0.4.4.md).

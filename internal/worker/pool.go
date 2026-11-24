@@ -201,7 +201,7 @@ func NewWorkloadPool(opts PoolOptions) *Pool {
 				p.logger,
 			)
 		default:
-			p.starter = NewStarter(opts.Cfg, opts.Sockets, opts.Spawner, p.logger, opts.Version)
+			p.starter = NewStarter(opts.Cfg, opts.Sockets, opts.Spawner, p.logger, opts.Version, opts.Name)
 		}
 	}
 	return p
@@ -1165,6 +1165,37 @@ func (p *Pool) Snapshot() PoolSnapshot {
 		}
 	}
 	return snap
+}
+
+// ManagedProc is one live worker the signal engine may attribute.
+type ManagedProc struct {
+	PID        int
+	Generation uint64
+}
+
+// ManagedProcesses returns running workers, excluding starting and draining.
+func (p *Pool) ManagedProcesses() []ManagedProc {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]ManagedProc, 0, len(p.slots))
+	for _, s := range p.slots {
+		if s.worker == nil {
+			continue
+		}
+		snap := s.worker.GetSnapshot()
+		if snap.PID <= 0 {
+			continue
+		}
+		switch snap.State {
+		case StateStarting, StateDraining, StateFailed:
+			continue
+		}
+		out = append(out, ManagedProc{PID: snap.PID, Generation: snap.Generation})
+	}
+	return out
 }
 
 // HealthyCount returns idle+busy+draining workers.

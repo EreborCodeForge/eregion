@@ -1,0 +1,10 @@
+adaptive:
+  min_gain_ratio: 0.05
+  max_p95_regression_ratio: 0.10
+  demand_tolerance_ratio: 0.15
+  baseline_windows: 3
+  evaluation_windows: 3
+  settle_windows: 2
+  probe_cooldown: 10m
+  probe_timeout: 3m
+  busy_threshold: 0.85

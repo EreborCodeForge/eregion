@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -199,25 +200,43 @@ type SlotStarter interface {
 
 // Starter boots an HTTP PHP worker process and completes EREGION handshake.
 type Starter struct {
-	cfg     config.Config
-	sockets *socket.Manager
-	spawner ProcessSpawner
-	logger  *slog.Logger
-	version string
+	cfg      config.Config
+	sockets  *socket.Manager
+	spawner  ProcessSpawner
+	logger   *slog.Logger
+	version  string
+	workload string
 }
 
 // NewStarter constructs an HTTP worker starter.
-func NewStarter(cfg config.Config, sockets *socket.Manager, spawner ProcessSpawner, logger *slog.Logger, version string) *Starter {
+func NewStarter(cfg config.Config, sockets *socket.Manager, spawner ProcessSpawner, logger *slog.Logger, version, workload string) *Starter {
 	if spawner == nil {
 		spawner = ExecSpawner{}
 	}
-	return &Starter{cfg: cfg, sockets: sockets, spawner: spawner, logger: logger, version: version}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if workload == "" {
+		workload = "http"
+	}
+	return &Starter{
+		cfg: cfg, sockets: sockets, spawner: spawner, logger: logger,
+		version: version, workload: workload,
+	}
 }
 
 // Start launches generation for a slot.
 func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restartCount uint64) (*Worker, error) {
 	id := fmt.Sprintf("worker-%d", slot)
 	sockPath := s.sockets.Path(slot, generation)
+	if err := socket.ValidateBindPath(sockPath); err != nil {
+		cause := CausePathInvalid
+		var lengthErr *socket.PathLengthError
+		if errors.As(err, &lengthErr) {
+			cause = CausePathTooLong
+		}
+		return nil, s.startupErr(StageSocketPath, cause, id, sockPath, "", err)
+	}
 	_ = s.sockets.Remove(sockPath)
 
 	w := &Worker{
@@ -250,20 +269,23 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 	cmd, stdout, stderr, err := s.spawner.Spawn(startCtx, spec)
 	if err != nil {
 		w.State = StateFailed
-		return nil, fmt.Errorf("spawn %s: %w", id, err)
+		return nil, s.startupErr(StageSpawn, CauseSpawnFailed, id, sockPath, "", err)
 	}
 	w.cmd = cmd
 	if cmd.Process != nil {
 		w.PID = cmd.Process.Pid
 	}
 
-	go drainLog(s.logger, id, "stdout", stdout)
-	go drainLog(s.logger, id, "stderr", stderr)
+	if stdout != nil {
+		go drainLog(s.logger, id, "stdout", stdout)
+	}
+	captured := &streamCapture{}
+	stderrDone := drainCapture(s.logger, id, "stderr", stderr, captured)
 
-	if err := waitForSocket(startCtx, sockPath); err != nil {
+	if err := s.waitForSocket(startCtx, id, sockPath, cmd, captured, stderrDone); err != nil {
 		_ = terminateProcess(cmd, s.cfg.Workers.ShutdownTimeout)
 		w.State = StateFailed
-		return nil, fmt.Errorf("wait socket %s: %w", sockPath, err)
+		return nil, err
 	}
 	_ = os.Chmod(sockPath, s.sockets.SocketPerm())
 
@@ -271,7 +293,7 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 	if err != nil {
 		_ = terminateProcess(cmd, s.cfg.Workers.ShutdownTimeout)
 		w.State = StateFailed
-		return nil, fmt.Errorf("dial %s: %w", sockPath, err)
+		return nil, s.startupErr(StageDial, CauseDialFailed, id, sockPath, captured.Text(), err)
 	}
 	cancel() // startup phase done; do not cancel handshake via startup deadline
 
@@ -290,7 +312,7 @@ func (s *Starter) Start(ctx context.Context, slot int, generation uint64, restar
 		_ = conn.Close()
 		_ = terminateProcess(cmd, s.cfg.Workers.ShutdownTimeout)
 		w.State = StateFailed
-		return nil, fmt.Errorf("handshake %s: %w", id, err)
+		return nil, s.startupErr(StageHandshake, CauseHandshakeFailed, id, sockPath, captured.Text(), err)
 	}
 	if ready.PID > 0 {
 		w.PID = ready.PID
@@ -393,11 +415,14 @@ func (s *ConsumerStarter) Start(ctx context.Context, slot int, generation uint64
 }
 
 func drainLog(logger *slog.Logger, workerID, stream string, r io.ReadCloser) {
+	if r == nil {
+		return
+	}
 	defer r.Close()
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)
-		if n > 0 {
+		if n > 0 && logger != nil {
 			logger.Debug("worker output", "worker_id", workerID, "stream", stream, "data", string(buf[:n]))
 		}
 		if err != nil {
@@ -406,19 +431,96 @@ func drainLog(logger *slog.Logger, workerID, stream string, r io.ReadCloser) {
 	}
 }
 
-func waitForSocket(ctx context.Context, path string) error {
+func (s *Starter) startupErr(stage, cause, workerID, path, stderr string, err error) error {
+	return &StartupError{
+		Workload: s.workload,
+		WorkerID: workerID,
+		Stage:    stage,
+		Cause:    cause,
+		Path:     path,
+		Stderr:   stderr,
+		Err:      err,
+	}
+}
+
+// waitForSocket returns when the socket exists, the child exits, or ctx ends.
+// Process exit comes from watchExit and does not call Cmd.Wait. Closing stderr
+// while the process remains alive is not readiness failure.
+func (s *Starter) waitForSocket(ctx context.Context, workerID, path string, cmd *exec.Cmd, captured *streamCapture, stderrDone <-chan struct{}) error {
+	var proc *os.Process
+	if cmd != nil {
+		proc = cmd.Process
+	}
+	exited, stop := watchExit(proc)
+	defer stop()
+
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, err := os.Stat(path); err == nil {
+		if socketReady(path) {
 			return nil
+		}
+		if processExited(exited) {
+			return s.exitedErr(workerID, path, captured, stderrDone)
+		}
+		if err := ctx.Err(); err != nil {
+			return s.missingErr(workerID, path, captured, err)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			if processExited(exited) {
+				return s.exitedErr(workerID, path, captured, stderrDone)
+			}
+			return s.missingErr(workerID, path, captured, ctx.Err())
+		case <-exited:
+			return s.exitedErr(workerID, path, captured, stderrDone)
+		case <-stderrDone:
+			stderrDone = nil
 		case <-ticker.C:
 		}
 	}
+}
+
+func processExited(exited <-chan struct{}) bool {
+	if exited == nil {
+		return false
+	}
+	select {
+	case <-exited:
+		return true
+	default:
+		return false
+	}
+}
+
+func socketReady(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func (s *Starter) exitedErr(workerID, path string, captured *streamCapture, stderrDone <-chan struct{}) error {
+	if stderrDone != nil {
+		select {
+		case <-stderrDone:
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	text := ""
+	if captured != nil {
+		text = captured.Text()
+	}
+	return s.startupErr(StageWaitSocket, causeFromStderr(text, true), workerID, path, text, errors.New("worker process exited before the socket was ready"))
+}
+
+func (s *Starter) missingErr(workerID, path string, captured *streamCapture, err error) error {
+	text := ""
+	if captured != nil {
+		text = captured.Text()
+	}
+	if err == nil {
+		err = errors.New("socket was not created")
+	}
+	return s.startupErr(StageWaitSocket, CauseSocketMissing, workerID, path, text, err)
 }
 
 func terminateProcess(cmd *exec.Cmd, grace time.Duration) error {

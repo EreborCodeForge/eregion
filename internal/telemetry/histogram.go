@@ -45,3 +45,21 @@ func (h *histogram) write(b *strings.Builder, name string) {
 	cumulative += h.counts[len(histogramBounds)].Load()
 	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", name, cumulative)
 }
+
+func (h *histogram) snapshot() []uint64 {
+	if h == nil {
+		return nil
+	}
+	out := make([]uint64, len(h.counts))
+	for i := range h.counts {
+		out[i] = h.counts[i].Load()
+	}
+	return out
+}
+
+// HistogramBounds is the closed latency bucket list shared with the signal engine.
+func HistogramBounds() []float64 {
+	out := make([]float64, len(histogramBounds))
+	copy(out, histogramBounds)
+	return out
+}

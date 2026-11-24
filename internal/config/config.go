@@ -79,12 +79,76 @@ type WorkloadResourcesConfig struct {
 
 // WorkloadScalingConfig is scaling policy knobs.
 type WorkloadScalingConfig struct {
-	Strategy         *string              `yaml:"strategy"`
-	ScaleUpCooldown  *string              `yaml:"scale_up_cooldown"`
-	ScaleDownIdleFor *string              `yaml:"scale_down_idle_for"`
-	AvgJobDuration   *string              `yaml:"avg_job_duration"`
-	TargetDrainTime  *string              `yaml:"target_drain_time"`
-	BacklogSource    *BacklogSourceConfig `yaml:"backlog_source"`
+	Strategy         *string                  `yaml:"strategy"`
+	ScaleUpCooldown  *string                  `yaml:"scale_up_cooldown"`
+	ScaleDownIdleFor *string                  `yaml:"scale_down_idle_for"`
+	AvgJobDuration   *string                  `yaml:"avg_job_duration"`
+	TargetDrainTime  *string                  `yaml:"target_drain_time"`
+	BacklogSource    *BacklogSourceConfig     `yaml:"backlog_source"`
+	Control          *ScalingControlConfig    `yaml:"control"`
+	CPU              *ScalingCPUConfig        `yaml:"cpu"`
+	Latency          *ScalingLatencyConfig    `yaml:"latency"`
+	Throughput       *ScalingThroughputConfig `yaml:"throughput"`
+	Scheduled        *ScalingScheduledConfig  `yaml:"scheduled"`
+	Adaptive         *ScalingAdaptiveConfig   `yaml:"adaptive"`
+}
+
+// ScalingControlConfig is the shared ECO-11 stabilizer.
+type ScalingControlConfig struct {
+	Window            *string `yaml:"window"`
+	MaxSignalAge      *string `yaml:"max_signal_age"`
+	UpConfirmations   *int    `yaml:"up_confirmations"`
+	DownConfirmations *int    `yaml:"down_confirmations"`
+	MaxStepUp         *int    `yaml:"max_step_up"`
+	MaxStepDown       *int    `yaml:"max_step_down"`
+}
+
+// ScalingCPUConfig is the cpu_utilization block.
+type ScalingCPUConfig struct {
+	TargetRatio    *float64 `yaml:"target_ratio"`
+	ToleranceRatio *float64 `yaml:"tolerance_ratio"`
+}
+
+// ScalingLatencyConfig is the latency block.
+type ScalingLatencyConfig struct {
+	TargetP95          *string  `yaml:"target_p95"`
+	QueueWaitTargetP95 *string  `yaml:"queue_wait_target_p95"`
+	ToleranceRatio     *float64 `yaml:"tolerance_ratio"`
+	BusyThreshold      *float64 `yaml:"busy_threshold"`
+}
+
+// ScalingThroughputConfig is the calibrated offered-rate block.
+type ScalingThroughputConfig struct {
+	TargetRPSPerWorker *float64 `yaml:"target_rps_per_worker"`
+	ToleranceRatio     *float64 `yaml:"tolerance_ratio"`
+}
+
+// ScalingScheduleWindowConfig is one UTC window.
+type ScalingScheduleWindowConfig struct {
+	Days          []string `yaml:"days"`
+	Start         *string  `yaml:"start"`
+	End           *string  `yaml:"end"`
+	TargetWorkers *int     `yaml:"target_workers"`
+}
+
+// ScalingScheduledConfig is the UTC calendar.
+type ScalingScheduledConfig struct {
+	Timezone       *string                       `yaml:"timezone"`
+	DefaultWorkers *int                          `yaml:"default_workers"`
+	Windows        []ScalingScheduleWindowConfig `yaml:"windows"`
+}
+
+// ScalingAdaptiveConfig is the bounded probe.
+type ScalingAdaptiveConfig struct {
+	MinGainRatio          *float64 `yaml:"min_gain_ratio"`
+	MaxP95RegressionRatio *float64 `yaml:"max_p95_regression_ratio"`
+	DemandToleranceRatio  *float64 `yaml:"demand_tolerance_ratio"`
+	BaselineWindows       *int     `yaml:"baseline_windows"`
+	EvaluationWindows     *int     `yaml:"evaluation_windows"`
+	SettleWindows         *int     `yaml:"settle_windows"`
+	ProbeCooldown         *string  `yaml:"probe_cooldown"`
+	ProbeTimeout          *string  `yaml:"probe_timeout"`
+	BusyThreshold         *float64 `yaml:"busy_threshold"`
 }
 
 // BacklogSourceConfig names an HTTP JSON backlog adapter. Env fields are variable names, not secrets.

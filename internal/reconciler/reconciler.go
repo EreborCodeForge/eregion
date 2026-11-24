@@ -7,6 +7,8 @@ import (
 
 	"github.com/EreborCodeForge/Eregion/internal/resources"
 	"github.com/EreborCodeForge/Eregion/internal/scaling"
+	"github.com/EreborCodeForge/Eregion/internal/scaling/signals"
+	"github.com/EreborCodeForge/Eregion/internal/telemetry"
 	"github.com/EreborCodeForge/Eregion/internal/worker"
 	"github.com/EreborCodeForge/Eregion/internal/workload"
 )
@@ -21,6 +23,17 @@ type Reconciler struct {
 	interval   time.Duration
 	hysteresis map[string]*scaling.Hysteresis
 	guard      *scaling.Guard
+	signals    *signals.Engine
+	control    *scaling.Controller
+	probes     *scaling.ProbeHub
+	backlog    *scaling.HTTPJSONBacklogProvider
+	metrics    *telemetry.Registry
+	clock      resources.Clock
+	lastLog    map[string]string
+	warned     bool
+	published  map[string]telemetry.ScalingWorkloadPublication
+	probeEpoch map[string]uint64
+	probeLast  map[string]signals.DemandDecision
 }
 
 // New creates a reconciler.
@@ -39,6 +52,11 @@ func New(
 		logger:     logger,
 		interval:   time.Second,
 		hysteresis: make(map[string]*scaling.Hysteresis),
+		control:    scaling.NewController(),
+		probes:     scaling.NewProbeHub(),
+		signals:    signals.NewEngine(nil, signals.OSReader{}),
+		lastLog:    map[string]string{},
+		published:  map[string]telemetry.ScalingWorkloadPublication{},
 	}
 }
 
@@ -63,6 +81,37 @@ func (r *Reconciler) SetGuard(g *scaling.Guard) {
 		return
 	}
 	r.guard = g
+}
+
+// SetBacklog attaches the cached backlog provider. Nil keeps backlog signals unknown.
+func (r *Reconciler) SetBacklog(p *scaling.HTTPJSONBacklogProvider) {
+	if r == nil {
+		return
+	}
+	r.backlog = p
+}
+
+// SetMetrics receives cached scaling publications. Nil skips them.
+func (r *Reconciler) SetMetrics(m *telemetry.Registry) {
+	if r == nil {
+		return
+	}
+	r.metrics = m
+}
+
+// SetClock injects the reconciler clock. Nil uses time.Now.
+func (r *Reconciler) SetClock(c resources.Clock) {
+	if r == nil {
+		return
+	}
+	r.clock = c
+}
+
+func (r *Reconciler) now() time.Time {
+	if r != nil && r.clock != nil {
+		return r.clock.Now()
+	}
+	return time.Now()
 }
 
 // ReconcileOnce performs a single reconcile pass.
@@ -124,7 +173,7 @@ func (r *Reconciler) reconcileLegacy(ctx context.Context) {
 		}
 		r.logger.Info("removing workload pool", "workload", pool.Name())
 		_ = r.pools.Remove(ctx, pool.Name())
-		delete(r.hysteresis, pool.Name())
+		r.forgetWorkload(pool.Name())
 	}
 }
 
@@ -142,6 +191,14 @@ func (r *Reconciler) reconcileGuarded(ctx context.Context) {
 			continue
 		}
 		pools[spec.Name] = pool
+	}
+	r.observeAdvanced(specs, pools)
+
+	for _, spec := range specs {
+		pool := pools[spec.Name]
+		if pool == nil {
+			continue
+		}
 		snap := pool.Snapshot()
 		metrics := workload.WorkloadMetrics{
 			Desired:  snap.Desired,
@@ -159,13 +216,19 @@ func (r *Reconciler) reconcileGuarded(ctx context.Context) {
 		} else {
 			h.Inner = inner
 		}
-		ev, policy := h.Decide(spec, metrics, r.runtime)
+		var raw, policy int
+		if workload.IsAdvanced(spec.Scaling.Strategy) {
+			raw, policy = r.advancedTarget(spec, pool, snap)
+		} else {
+			ev, legacy := h.Decide(spec, metrics, r.runtime)
+			raw, policy = ev.RawDemand, legacy
+		}
 		demands = append(demands, scaling.WorkloadDemand{
 			Name:      spec.Name,
 			Strategy:  string(spec.Scaling.Strategy),
 			Min:       spec.Workers.Min,
 			Max:       spec.Workers.Max,
-			Requested: ev.RawDemand,
+			Requested: raw,
 			Policy:    policy,
 			Running:   snap.Running,
 			Starting:  snap.Starting,
@@ -185,6 +248,9 @@ func (r *Reconciler) reconcileGuarded(ctx context.Context) {
 		}
 		snap := pool.Snapshot()
 		if r.guard.Mode() == "enforce" {
+			if workload.IsAdvanced(workload.ScalingStrategyName(decision.Strategy)) && decision.Admitted < decision.PolicyTarget {
+				r.control.RevertLast(name)
+			}
 			if decision.Admitted != snap.Desired {
 				r.logger.Info("reconciling workers",
 					"workload", name,
@@ -214,6 +280,23 @@ func (r *Reconciler) reconcileGuarded(ctx context.Context) {
 		}
 		r.logger.Info("removing workload pool", "workload", pool.Name())
 		_ = r.pools.Remove(ctx, pool.Name())
-		delete(r.hysteresis, pool.Name())
+		r.forgetWorkload(pool.Name())
 	}
+}
+
+func (r *Reconciler) forgetWorkload(name string) {
+	delete(r.hysteresis, name)
+	delete(r.lastLog, name)
+	if r.control != nil {
+		r.control.Forget(name)
+	}
+	if r.signals != nil {
+		r.signals.Forget(name)
+	}
+	if r.probes != nil {
+		r.probes.Forget(name)
+	}
+	delete(r.published, name)
+	delete(r.probeEpoch, name)
+	delete(r.probeLast, name)
 }

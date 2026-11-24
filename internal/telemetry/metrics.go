@@ -81,6 +81,20 @@ type Registry struct {
 	backlog         BacklogStats
 	guardObs        atomic.Value // GuardObservation
 	admissionDenied sync.Map     // "workload|reason" -> *atomic.Uint64
+
+	signalCapture    atomic.Bool
+	completedTotal   atomic.Uint64
+	successTotal     atomic.Uint64
+	clientErrorTotal atomic.Uint64
+	serverErrorTotal atomic.Uint64
+	localRejectTotal atomic.Uint64
+	signalDuration   *histogram
+	signalQueue      *histogram
+	scalingPub       atomic.Value // ScalingPublication
+	scalingDecisions sync.Map     // workload|strategy|action|reason -> *atomic.Uint64
+	phaseSignal      *histogram
+	phaseEvaluate    *histogram
+	phasePlan        *histogram
 }
 
 // BacklogStats is the last backlog sample for one workload. measured is false when the value is unknown.
@@ -110,6 +124,11 @@ func NewRegistry(cfg config.Config, pools *worker.Manager, res resources.Runtime
 		durationHist:          newHistogram(),
 		queueWaitHist:         newHistogram(),
 		roundtripHist:         newHistogram(),
+		signalDuration:        newHistogram(),
+		signalQueue:           newHistogram(),
+		phaseSignal:           newHistogram(),
+		phaseEvaluate:         newHistogram(),
+		phasePlan:             newHistogram(),
 	}
 }
 
@@ -469,6 +488,7 @@ func (r *Registry) Handler() http.HandlerFunc {
 		}
 
 		r.writeResourceGuard(&b)
+		r.writeScaling(&b)
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write([]byte(b.String()))

@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ func (s *CgroupSampler) Sample(ctx context.Context) (Sample, error) {
 	}
 
 	if membership.Version == 2 {
+		root = v2SampleRoot(rd, root, membership.Unified)
 		return s.sampleV2(rd, root, membership, now), nil
 	}
 	return s.sampleV1(rd, root, membership, now), nil
@@ -162,6 +164,16 @@ func (s *CgroupSampler) readCPU(rd FileReader, dirs []string, leaf string, v2 bo
 		out.CPUCapacity = cap
 	}
 	usage, usageOK, periods, throttled, periodOK := readCPUCounters(rd, leaf, v2)
+	if capValid != ValidityKnown && usageOK {
+		n := runtime.NumCPU()
+		if n < 1 {
+			n = 1
+		}
+		cap = float64(n)
+		capValid = ValidityKnown
+		out.CPUCapacity = cap
+		out.CPUCapacityValid = ValidityKnown
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev := s.prev
@@ -182,7 +194,16 @@ func (s *CgroupSampler) readCPU(rd FileReader, dirs []string, leaf string, v2 bo
 			}
 		}
 	}
-	if prev == nil || !periodOK || !prev.hasPeriod {
+	if !periodOK {
+		if usageOK {
+			out.CPUThrottledRatio = 0
+			out.CPUThrottlingValid = ValidityKnown
+		} else {
+			out.CPUThrottlingValid = ValidityUnknown
+		}
+		return
+	}
+	if prev == nil || !prev.hasPeriod {
 		out.CPUThrottlingValid = ValidityUnknown
 		return
 	}
@@ -451,6 +472,48 @@ func parseCPUStat(content string) (usageUsec float64, usageOK bool, periods, thr
 		return usageUsec, usageOK, 0, 0, false
 	}
 	return usageUsec, usageOK, periods, throttled, true
+}
+
+// v2SampleRoot keeps root when that hierarchy has the process leaf.
+// A hybrid host mounts cgroup2 elsewhere, often /sys/fs/cgroup/unified.
+func v2SampleRoot(rd FileReader, root, unified string) string {
+	if leaf, ok := ResolveCgroupPath(root, unified); ok && v2LeafExists(rd, leaf) {
+		return root
+	}
+	mount := cgroup2Mount(rd)
+	if mount == "" || mount == root {
+		return root
+	}
+	if leaf, ok := ResolveCgroupPath(mount, unified); ok && v2LeafExists(rd, leaf) {
+		return mount
+	}
+	return root
+}
+
+func v2LeafExists(rd FileReader, leaf string) bool {
+	for _, name := range []string{"cgroup.controllers", "cpu.stat", "memory.current"} {
+		if _, err := rd.ReadFile(joinRoot(leaf, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func cgroup2Mount(rd FileReader) string {
+	raw, err := rd.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(line, " - cgroup2 ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && strings.HasPrefix(fields[4], "/") {
+			return fields[4]
+		}
+	}
+	return ""
 }
 
 func isAbsent(err error) bool {

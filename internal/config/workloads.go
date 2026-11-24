@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/EreborCodeForge/Eregion/internal/scaling/signals"
 	"github.com/EreborCodeForge/Eregion/internal/workload"
 )
 
@@ -37,7 +38,21 @@ func (c *Config) ResolveWorkloads() ([]workload.ResolvedWorkloadSpec, error) {
 		MemoryLimitMB:    c.Workers.MemoryLimitMB,
 	}
 
-	return workload.BuildFromConfig(templates, specs, legacy, c.HasExplicitWorkloads)
+	resolved, err := workload.BuildFromConfig(templates, specs, legacy, c.HasExplicitWorkloads)
+	if err != nil {
+		return nil, err
+	}
+	caps := workload.PlatformCaps{WorkerCPU: workerCPUSupported()}
+	for _, spec := range resolved {
+		if err := workload.ValidateAdvanced(spec, c.ResourceGuard.Mode, caps); err != nil {
+			return nil, err
+		}
+	}
+	return resolved, nil
+}
+
+func workerCPUSupported() bool {
+	return signals.WorkerCPUSupported()
 }
 
 func convertTemplate(name string, tpl WorkloadTemplateConfig) (workload.WorkloadTemplate, error) {
@@ -174,5 +189,169 @@ func convertScaling(s WorkloadScalingConfig) (workload.ScalingPolicy, error) {
 		}
 		out.BacklogSource = src
 	}
+	if s.ScaleUpCooldown != nil {
+		out.CooldownSet = true
+	}
+	if s.ScaleDownIdleFor != nil {
+		out.IdleSet = true
+	}
+	if s.Control != nil {
+		c := workload.ControlPolicy{Configured: true}
+		if s.Control.Window != nil {
+			c.Window, err = time.ParseDuration(*s.Control.Window)
+			if err != nil {
+				return out, fmt.Errorf("invalid control.window: %w", err)
+			}
+		}
+		if s.Control.MaxSignalAge != nil {
+			c.MaxSignalAge, err = time.ParseDuration(*s.Control.MaxSignalAge)
+			if err != nil {
+				return out, fmt.Errorf("invalid control.max_signal_age: %w", err)
+			}
+		}
+		if s.Control.UpConfirmations != nil {
+			c.UpConfirmations = *s.Control.UpConfirmations
+		}
+		if s.Control.DownConfirmations != nil {
+			c.DownConfirmations = *s.Control.DownConfirmations
+		}
+		if s.Control.MaxStepUp != nil {
+			c.MaxStepUp = *s.Control.MaxStepUp
+		}
+		if s.Control.MaxStepDown != nil {
+			c.MaxStepDown = *s.Control.MaxStepDown
+		}
+		out.Control = c
+	}
+	if s.CPU != nil {
+		cpu := workload.CPUPolicy{Configured: true, TargetRatio: 0.65, ToleranceRatio: 0.10}
+		if s.CPU.TargetRatio != nil {
+			cpu.TargetRatio = *s.CPU.TargetRatio
+		}
+		if s.CPU.ToleranceRatio != nil {
+			cpu.ToleranceRatio = *s.CPU.ToleranceRatio
+		}
+		out.CPU = cpu
+	}
+	if s.Latency != nil {
+		lat := workload.LatencyPolicy{Configured: true, ToleranceRatio: 0.15, BusyThreshold: 0.85}
+		if s.Latency.TargetP95 != nil {
+			lat.TargetP95, err = time.ParseDuration(*s.Latency.TargetP95)
+			if err != nil {
+				return out, fmt.Errorf("invalid latency.target_p95: %w", err)
+			}
+		}
+		if s.Latency.QueueWaitTargetP95 != nil {
+			lat.QueueWaitTargetP95, err = time.ParseDuration(*s.Latency.QueueWaitTargetP95)
+			if err != nil {
+				return out, fmt.Errorf("invalid latency.queue_wait_target_p95: %w", err)
+			}
+		}
+		if s.Latency.ToleranceRatio != nil {
+			lat.ToleranceRatio = *s.Latency.ToleranceRatio
+		}
+		if s.Latency.BusyThreshold != nil {
+			lat.BusyThreshold = *s.Latency.BusyThreshold
+		}
+		out.Latency = lat
+	}
+	if s.Throughput != nil {
+		tp := workload.ThroughputPolicy{Configured: true, ToleranceRatio: 0.10}
+		if s.Throughput.TargetRPSPerWorker != nil {
+			tp.TargetRPSPerWorker = *s.Throughput.TargetRPSPerWorker
+		}
+		if s.Throughput.ToleranceRatio != nil {
+			tp.ToleranceRatio = *s.Throughput.ToleranceRatio
+		}
+		out.Throughput = tp
+	}
+	if s.Scheduled != nil {
+		sc, err := convertScheduled(*s.Scheduled)
+		if err != nil {
+			return out, err
+		}
+		out.Scheduled = sc
+	}
+	if s.Adaptive != nil {
+		ad := workload.AdaptivePolicy{
+			Configured: true, MinGainRatio: 0.03, MaxP95RegressionRatio: 0.10, DemandToleranceRatio: 0.10,
+			BaselineWindows: 3, EvaluationWindows: 3, SettleWindows: 1, ProbeCooldown: 60 * time.Second,
+			ProbeTimeout: 180 * time.Second, BusyThreshold: 0.85,
+		}
+		if s.Adaptive.MinGainRatio != nil {
+			ad.MinGainRatio = *s.Adaptive.MinGainRatio
+		}
+		if s.Adaptive.MaxP95RegressionRatio != nil {
+			ad.MaxP95RegressionRatio = *s.Adaptive.MaxP95RegressionRatio
+		}
+		if s.Adaptive.DemandToleranceRatio != nil {
+			ad.DemandToleranceRatio = *s.Adaptive.DemandToleranceRatio
+		}
+		if s.Adaptive.BaselineWindows != nil {
+			ad.BaselineWindows = *s.Adaptive.BaselineWindows
+		}
+		if s.Adaptive.EvaluationWindows != nil {
+			ad.EvaluationWindows = *s.Adaptive.EvaluationWindows
+		}
+		if s.Adaptive.SettleWindows != nil {
+			ad.SettleWindows = *s.Adaptive.SettleWindows
+		}
+		if s.Adaptive.ProbeCooldown != nil {
+			ad.ProbeCooldown, err = time.ParseDuration(*s.Adaptive.ProbeCooldown)
+			if err != nil {
+				return out, fmt.Errorf("invalid adaptive.probe_cooldown: %w", err)
+			}
+		}
+		if s.Adaptive.ProbeTimeout != nil {
+			ad.ProbeTimeout, err = time.ParseDuration(*s.Adaptive.ProbeTimeout)
+			if err != nil {
+				return out, fmt.Errorf("invalid adaptive.probe_timeout: %w", err)
+			}
+		}
+		if s.Adaptive.BusyThreshold != nil {
+			ad.BusyThreshold = *s.Adaptive.BusyThreshold
+		}
+		out.Adaptive = ad
+	}
 	return out, nil
+}
+
+func convertScheduled(s ScalingScheduledConfig) (workload.ScheduledPolicy, error) {
+	out := workload.ScheduledPolicy{Configured: true, Timezone: "UTC"}
+	if s.Timezone != nil {
+		out.Timezone = *s.Timezone
+	}
+	if s.DefaultWorkers != nil {
+		out.DefaultWorkers = *s.DefaultWorkers
+	}
+	for i, w := range s.Windows {
+		item := workload.ScheduleWindow{Days: append([]string(nil), w.Days...)}
+		if w.Start == nil || w.End == nil || w.TargetWorkers == nil {
+			return out, fmt.Errorf("scheduled.windows[%d] requires days, start, end and target_workers", i)
+		}
+		start, err := parseClock(*w.Start)
+		if err != nil {
+			return out, fmt.Errorf("scheduled.windows[%d].start: %w", i, err)
+		}
+		end, err := parseClock(*w.End)
+		if err != nil {
+			return out, fmt.Errorf("scheduled.windows[%d].end: %w", i, err)
+		}
+		item.StartMin = start
+		item.EndMin = end
+		item.Target = *w.TargetWorkers
+		out.Windows = append(out.Windows, item)
+	}
+	return out, nil
+}
+
+func parseClock(v string) (int, error) {
+	if v == "24:00" {
+		return 24 * 60, nil
+	}
+	t, err := time.Parse("15:04", v)
+	if err != nil {
+		return 0, fmt.Errorf("expected HH:MM")
+	}
+	return t.Hour()*60 + t.Minute(), nil
 }

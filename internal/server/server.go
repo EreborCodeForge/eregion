@@ -108,6 +108,14 @@ func New(cfg config.Config, logger *slog.Logger, version string) (*Server, error
 		metrics.SetBacklogStats(backlog)
 	}
 	rec := reconciler.New(registry, pools, strategies, runtimeRes, logger)
+	rec.SetBacklog(backlog)
+	rec.SetMetrics(metrics)
+	for _, spec := range resolved {
+		if spec.Mode == workload.ModeHTTP && workload.IsAdvanced(spec.Scaling.Strategy) {
+			metrics.EnableSignalCapture()
+			break
+		}
+	}
 	collector, guard := newResourceGuard(cfg, metrics, logger)
 	rec.SetGuard(guard)
 	if cfg.ResourceGuard.Mode == "enforce" && guard != nil && guard.Ledger != nil {
